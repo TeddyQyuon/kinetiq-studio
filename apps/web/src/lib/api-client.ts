@@ -253,13 +253,15 @@ export const api = {
   async regenerateScene(
     projectId: string,
     sceneId: string,
-    body: { prompt?: string; model?: string; camera?: string },
+    body: { prompt?: string; model?: string; camera?: string; seed?: number },
+    expectedRevision?: number,
   ): Promise<{ ok: boolean; revision: number; queued_job_id: string }> {
     return (
       await requestJson<{ ok: boolean; revision: number; queued_job_id: string }>(
         `/v1/projects/${projectId}/scenes/${sceneId}/regenerate`,
         {
           method: "POST",
+          headers: expectedRevision !== undefined ? { "If-Match": String(expectedRevision) } : undefined,
           body: JSON.stringify(body),
         },
       )

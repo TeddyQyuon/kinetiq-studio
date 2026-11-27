@@ -59,8 +59,9 @@ type QueuedServerOp =
   | {
       kind: "regenerate";
       sceneId: string;
-      patch: { prompt?: string; model?: ModelChoice; camera?: CameraPreset };
-    };
+      patch: { prompt?: string; model?: ModelChoice; camera?: CameraPreset; seed?: number };
+    }
+  | { kind: "accept_proposal"; proposalId: string; confirmSpend: boolean };
 
 function formatTimeMs(ms: number): string {
   const clamped = Math.max(0, ms);
@@ -280,8 +281,15 @@ export default function VideoEditorPage() {
             } else {
               advanceServerRevision(updated.revision);
             }
-          } else {
-            await api.regenerateScene(projectId, op.sceneId, op.patch);
+          } else if (op.kind === "regenerate") {
+            const current = await api.getProject(projectId);
+            if (current.data.timeline.revision !== expectedRev) {
+              throw new ApiError(
+                `Server revision changed (${current.data.timeline.revision} vs expected ${expectedRev}).`,
+                409,
+              );
+            }
+            await api.regenerateScene(projectId, op.sceneId, op.patch, expectedRev);
             const fresh = await api.getProject(projectId);
             pendingOpsRef.current.shift();
             setServerBaseDoc(fresh.data.timeline);
@@ -290,6 +298,21 @@ export default function VideoEditorPage() {
               markSyncedFromServer(fresh.data.timeline);
             } else {
               advanceServerRevision(fresh.data.timeline.revision);
+            }
+          } else {
+            const updated = await api.acceptCopilot(
+              projectId,
+              op.proposalId,
+              expectedRev,
+              op.confirmSpend,
+            );
+            pendingOpsRef.current.shift();
+            setServerBaseDoc(updated);
+            setPendingProposal(null);
+            if (pendingOpsRef.current.length === 0) {
+              markSyncedFromServer(updated);
+            } else {
+              advanceServerRevision(updated.revision);
             }
           }
         } catch (err) {
@@ -310,7 +333,43 @@ export default function VideoEditorPage() {
     } finally {
       drainingOpsRef.current = false;
     }
-  }, [advanceServerRevision, isDemo, markSyncedFromServer, mergeMediaUrls, projectId, setSyncState]);
+  }, [
+    advanceServerRevision,
+    isDemo,
+    markSyncedFromServer,
+    mergeMediaUrls,
+    projectId,
+    setPendingProposal,
+    setSyncState,
+  ]);
+
+  const enqueueCommandBatch = useCallback((commands: TimelineCommand[]) => {
+    let buffer: TimelineCommand[] = [];
+    const flush = () => {
+      if (buffer.length > 0) {
+        pendingOpsRef.current.push({ kind: "commands", commands: buffer });
+        buffer = [];
+      }
+    };
+    for (const cmd of commands) {
+      if (cmd.type === "regenerate_clip") {
+        flush();
+        pendingOpsRef.current.push({
+          kind: "regenerate",
+          sceneId: cmd.scene_id,
+          patch: {
+            prompt: cmd.prompt,
+            model: cmd.model,
+            camera: cmd.camera,
+            seed: cmd.seed,
+          },
+        });
+      } else {
+        buffer.push(cmd);
+      }
+    }
+    flush();
+  }, []);
 
   // Unified local + IndexedDB + serialized backend command commit
   const commitTimelineCommands = useCallback(
@@ -318,10 +377,10 @@ export default function VideoEditorPage() {
       if (!document || commands.length === 0) return;
       dispatchLocalBatch(commands, label);
       if (isDemo) return;
-      pendingOpsRef.current.push({ kind: "commands", commands });
+      enqueueCommandBatch(commands);
       await drainWriteQueue();
     },
-    [dispatchLocalBatch, document, drainWriteQueue, isDemo],
+    [dispatchLocalBatch, document, drainWriteQueue, enqueueCommandBatch, isDemo],
   );
 
   const triggerSceneRegeneration = useCallback(
@@ -342,16 +401,16 @@ export default function VideoEditorPage() {
   const handleUndo = useCallback(async () => {
     const cmds = undo();
     if (!cmds || isDemo) return;
-    pendingOpsRef.current.push({ kind: "commands", commands: cmds });
+    enqueueCommandBatch(cmds);
     await drainWriteQueue();
-  }, [drainWriteQueue, isDemo, undo]);
+  }, [drainWriteQueue, enqueueCommandBatch, isDemo, undo]);
 
   const handleRedo = useCallback(async () => {
     const cmds = redo();
     if (!cmds || isDemo) return;
-    pendingOpsRef.current.push({ kind: "commands", commands: cmds });
+    enqueueCommandBatch(cmds);
     await drainWriteQueue();
-  }, [drainWriteQueue, isDemo, redo]);
+  }, [drainWriteQueue, enqueueCommandBatch, isDemo, redo]);
 
   const activeSceneAtPlayhead = useMemo(() => {
     if (!document) return null;
@@ -497,15 +556,12 @@ export default function VideoEditorPage() {
     if (needsSpendConfirm && !confirmSpend) return;
 
     if (!isDemo) {
-      const updated = await api.acceptCopilot(
-        projectId,
-        pendingProposal.proposal_id,
-        serverRevision,
-        true,
-      );
-      setServerBaseDoc(updated);
-      markSyncedFromServer(updated);
-      setPendingProposal(null);
+      pendingOpsRef.current.push({
+        kind: "accept_proposal",
+        proposalId: pendingProposal.proposal_id,
+        confirmSpend: true,
+      });
+      await drainWriteQueue();
     } else {
       acceptPendingProposalLocal();
     }
