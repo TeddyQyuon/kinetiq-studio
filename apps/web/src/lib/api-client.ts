@@ -28,6 +28,15 @@ export interface IdentityStatus {
   mcp_configured: boolean;
 }
 
+export class ApiError extends Error {
+  status: number;
+  constructor(message: string, status: number) {
+    super(message);
+    this.name = "ApiError";
+    this.status = status;
+  }
+}
+
 const DEMO_IDENTITY: IdentityStatus = {
   user_id: "usr_demo",
   email: "creator@kinetiq.local",
@@ -39,6 +48,52 @@ const DEMO_IDENTITY: IdentityStatus = {
   mcp_configured: false,
 };
 
+function cloneData<T>(value: T): T {
+  return JSON.parse(JSON.stringify(value)) as T;
+}
+
+export function isDemoProjectId(id: string): boolean {
+  return DEMO_PROJECTS.some((p) => p.id === id);
+}
+
+const BACKEND_CACHE_TTL_MS = 10_000;
+let cachedBackendOnline: { online: boolean; checkedAt: number } | null = null;
+let inflightBackendCheck: Promise<boolean> | null = null;
+
+export async function checkBackendOnline(forceRefresh = false): Promise<boolean> {
+  if (typeof window === "undefined") {
+    return true;
+  }
+  const now = Date.now();
+  if (!forceRefresh && cachedBackendOnline && now - cachedBackendOnline.checkedAt < BACKEND_CACHE_TTL_MS) {
+    return cachedBackendOnline.online;
+  }
+  if (!forceRefresh && inflightBackendCheck) {
+    return inflightBackendCheck;
+  }
+
+  inflightBackendCheck = (async () => {
+    try {
+      const res = await fetch("/api/backend-status", { cache: "no-store" });
+      if (!res.ok) {
+        cachedBackendOnline = { online: false, checkedAt: Date.now() };
+        return false;
+      }
+      const data = (await res.json()) as { online?: boolean };
+      const online = Boolean(data.online);
+      cachedBackendOnline = { online, checkedAt: Date.now() };
+      return online;
+    } catch {
+      cachedBackendOnline = { online: false, checkedAt: Date.now() };
+      return false;
+    } finally {
+      inflightBackendCheck = null;
+    }
+  })();
+
+  return inflightBackendCheck;
+}
+
 async function requestJson<T>(path: string, init?: RequestInit): Promise<{ data: T; demo: boolean }> {
   const res = await fetch(`${API_BASE}${path}`, {
     ...init,
@@ -49,7 +104,7 @@ async function requestJson<T>(path: string, init?: RequestInit): Promise<{ data:
   });
   if (!res.ok) {
     const errText = await res.text().catch(() => res.statusText);
-    throw new Error(errText || `HTTP ${res.status}`);
+    throw new ApiError(errText || `HTTP ${res.status}`, res.status);
   }
   const data = (await res.json()) as T;
   return { data, demo: false };
@@ -57,27 +112,37 @@ async function requestJson<T>(path: string, init?: RequestInit): Promise<{ data:
 
 export const api = {
   async getIdentity(): Promise<{ data: IdentityStatus; demo: boolean }> {
+    if (!(await checkBackendOnline())) {
+      return { data: cloneData(DEMO_IDENTITY), demo: true };
+    }
     try {
       return await requestJson<IdentityStatus>("/v1/me");
     } catch {
-      return { data: DEMO_IDENTITY, demo: true };
+      return { data: cloneData(DEMO_IDENTITY), demo: true };
     }
   },
 
   async listProjects(): Promise<{ data: ProjectSummary[]; demo: boolean }> {
+    if (!(await checkBackendOnline())) {
+      return { data: cloneData(DEMO_PROJECTS), demo: true };
+    }
     try {
       return await requestJson<ProjectSummary[]>("/v1/projects");
     } catch {
-      return { data: DEMO_PROJECTS, demo: true };
+      return { data: cloneData(DEMO_PROJECTS), demo: true };
     }
   },
 
   async getProject(id: string): Promise<{ data: ProjectDetail; demo: boolean }> {
+    if (!(await checkBackendOnline())) {
+      const found = DEMO_PROJECTS.find((p) => p.id === id) ?? DEMO_PROJECTS[0];
+      return { data: cloneData(found), demo: true };
+    }
     try {
       return await requestJson<ProjectDetail>(`/v1/projects/${id}`);
     } catch {
       const found = DEMO_PROJECTS.find((p) => p.id === id) ?? DEMO_PROJECTS[0];
-      return { data: found, demo: true };
+      return { data: cloneData(found), demo: true };
     }
   },
 
@@ -91,6 +156,21 @@ export const api = {
     brain_mode: BrainMode;
     script_override?: string;
   }): Promise<{ data: ProjectDetail; demo: boolean }> {
+    if (!(await checkBackendOnline())) {
+      const demoProj: ProjectDetail = {
+        ...cloneData(DEMO_PROJECTS[0]),
+        id: `prj_demo_${Date.now().toString(36)}`,
+        title: payload.title,
+        topic: payload.topic,
+        aspect: payload.aspect,
+        target_res: payload.target_res,
+        duration_preset: payload.duration_preset,
+        qa_policy: payload.qa_policy,
+        brain_mode: payload.brain_mode,
+        status: "planned",
+      };
+      return { data: demoProj, demo: true };
+    }
     try {
       return await requestJson<ProjectDetail>("/v1/projects", {
         method: "POST",
@@ -98,7 +178,7 @@ export const api = {
       });
     } catch {
       const demoProj: ProjectDetail = {
-        ...DEMO_PROJECTS[0],
+        ...cloneData(DEMO_PROJECTS[0]),
         id: `prj_demo_${Date.now().toString(36)}`,
         title: payload.title,
         topic: payload.topic,
@@ -114,6 +194,16 @@ export const api = {
   },
 
   async getChatGPTBrief(projectId: string): Promise<DirectorBriefExport> {
+    if (!(await checkBackendOnline())) {
+      return {
+        project_id: projectId,
+        instructions:
+          "Act as an elite faceless educational video director. Return ONLY valid JSON matching PlannedStoryboard with alternating 'ai_video', 'diagram', and 'image_motion' scenes.",
+        schema_hint: {
+          required: ["palette", "look", "negative", "hook", "seo_title", "scenes"],
+        },
+      };
+    }
     try {
       return (await requestJson<DirectorBriefExport>(`/v1/projects/${projectId}/plan/brief`)).data;
     } catch {
@@ -146,10 +236,13 @@ export const api = {
   },
 
   async listQAReviews(projectId: string): Promise<QAReviewRecord[]> {
+    if (!(await checkBackendOnline())) {
+      return cloneData(DEMO_QA_REVIEWS);
+    }
     try {
       return (await requestJson<QAReviewRecord[]>(`/v1/projects/${projectId}/qa-reviews`)).data;
     } catch {
-      return DEMO_QA_REVIEWS;
+      return cloneData(DEMO_QA_REVIEWS);
     }
   },
 
@@ -182,11 +275,40 @@ export const api = {
     ).data;
   },
 
+  async putTimeline(
+    projectId: string,
+    expectedRevision: number,
+    document: TimelineDocument,
+  ): Promise<TimelineDocument> {
+    return (
+      await requestJson<TimelineDocument>(`/v1/projects/${projectId}/timeline`, {
+        method: "PUT",
+        headers: { "If-Match": String(expectedRevision) },
+        body: JSON.stringify({ expected_revision: expectedRevision, author: "user", document }),
+      })
+    ).data;
+  },
+
   async copilotChat(
     projectId: string,
     message: string,
     selectedSceneId?: string | null,
   ): Promise<CopilotProposal> {
+    if (!(await checkBackendOnline())) {
+      const target = selectedSceneId || "scn_003";
+      return {
+        proposal_id: `prop_demo_${Date.now().toString(36)}`,
+        assistant_message: "Demo Copilot: Prepared a 1-click preview edit for your timeline.",
+        commands: [
+          { type: "tighten_pauses", max_gap_ms: 80 },
+          { type: "regenerate_clip", scene_id: target, camera: "cinematic_orbit" },
+        ],
+        affected_scenes: [target],
+        est_cu: 0.08,
+        requires_confirmation: false,
+        status: "pending",
+      };
+    }
     try {
       return (
         await requestJson<CopilotProposal>(`/v1/projects/${projectId}/copilot`, {
@@ -229,10 +351,13 @@ export const api = {
   },
 
   async listWorkers(): Promise<{ data: WorkerRecord[]; demo: boolean }> {
+    if (!(await checkBackendOnline())) {
+      return { data: cloneData(DEMO_WORKERS), demo: true };
+    }
     try {
       return await requestJson<WorkerRecord[]>("/v1/workers");
     } catch {
-      return { data: DEMO_WORKERS, demo: true };
+      return { data: cloneData(DEMO_WORKERS), demo: true };
     }
   },
 
@@ -246,6 +371,9 @@ export const api = {
   },
 
   async listJobs(projectId: string): Promise<JobRecord[]> {
+    if (!(await checkBackendOnline())) {
+      return [];
+    }
     try {
       return (await requestJson<JobRecord[]>(`/v1/projects/${projectId}/jobs`)).data;
     } catch {
@@ -254,13 +382,19 @@ export const api = {
   },
 
   async listExports(projectId: string): Promise<{ data: ExportRecord[]; demo: boolean }> {
+    if (!(await checkBackendOnline())) {
+      const filtered = DEMO_EXPORTS.filter((e) => e.project_id === projectId);
+      return {
+        data: cloneData(filtered.length ? filtered : DEMO_EXPORTS),
+        demo: true,
+      };
+    }
     try {
       return await requestJson<ExportRecord[]>(`/v1/projects/${projectId}/exports`);
     } catch {
+      const filtered = DEMO_EXPORTS.filter((e) => e.project_id === projectId);
       return {
-        data: DEMO_EXPORTS.filter((e) => e.project_id === projectId).length
-          ? DEMO_EXPORTS.filter((e) => e.project_id === projectId)
-          : DEMO_EXPORTS,
+        data: cloneData(filtered.length ? filtered : DEMO_EXPORTS),
         demo: true,
       };
     }
