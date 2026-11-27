@@ -11,7 +11,6 @@ from pathlib import Path
 from typing import Any
 
 import httpx
-import websocket
 from kinetiq_agent_core import WorkerClient
 
 PROFILE_CAPS: dict[str, list[str]] = {
@@ -83,6 +82,30 @@ def make_mock_clip(path: Path, job: dict[str, Any]) -> None:
     )
 
 
+class ComfyOutOfMemory(RuntimeError):
+    def __init__(self, prompt_id: str, data: dict):
+        super().__init__("ComfyUI ran out of GPU memory")
+        self.prompt_id = prompt_id
+        self.node_type = str(data.get("node_type", ""))[:80]
+
+
+def cleanup_comfy(comfy_url: str, oom: ComfyOutOfMemory | None = None) -> dict[str, bool]:
+    requests = []
+    if oom:
+        # Remove only this worker's prompt. Other clients may share the queue.
+        requests.append(("queue", {"delete": [oom.prompt_id]}))
+    requests.append(("free", {"unload_models": oom is not None, "free_memory": True}))
+    result = {}
+    for endpoint, body in requests:
+        try:
+            httpx.post(f"{comfy_url}/{endpoint}", json=body, timeout=5).raise_for_status()
+            result[endpoint] = True
+        except httpx.HTTPError:
+            print(f"ComfyUI /{endpoint} cleanup unavailable.")
+            result[endpoint] = False
+    return result
+
+
 def execute_comfy_graph(
     client: WorkerClient,
     comfy_url: str,
@@ -90,6 +113,8 @@ def execute_comfy_graph(
     job_id: str,
     graph: dict[str, Any],
 ) -> Path:
+    import websocket
+
     cid = str(uuid.uuid4())
     ws_url = comfy_url.replace("http://", "ws://").replace("https://", "wss://") + f"/ws?clientId={cid}"
     ws = websocket.create_connection(ws_url)
@@ -107,7 +132,14 @@ def execute_comfy_graph(
             if ev.get("data", {}).get("prompt_id") != prompt_id:
                 continue
             if ev.get("type") in {"execution_error", "execution_interrupted"}:
-                raise RuntimeError(ev["data"].get("exception_message") or ev["type"])
+                data = ev["data"]
+                message = str(data.get("exception_message") or ev["type"])
+                kind = str(data.get("exception_type", "")).lower()
+                detail = message.lower()
+                if ("outofmemoryerror" in kind or "cuda out of memory" in detail
+                        or "cuda error: out of memory" in detail):
+                    raise ComfyOutOfMemory(prompt_id, data)
+                raise RuntimeError(message)
             if ev.get("type") == "progress":
                 d = ev["data"]
                 pct = int(100 * d["value"] / max(d["max"], 1))
@@ -178,6 +210,7 @@ def main() -> None:
             last_work = time.time()
             job_id = job["id"]
             t0 = time.time()
+            oom_handled = False
             try:
                 with wc.keep_lease(job_id):
                     is_keyframe = job["job_type"] == "keyframe_qwen"
@@ -214,17 +247,23 @@ def main() -> None:
                 if not is_keyframe:
                     proxy_path.unlink(missing_ok=True)
                 out_path.unlink(missing_ok=True)
+            except ComfyOutOfMemory as exc:
+                cleanup = cleanup_comfy(args.comfy_url, exc)
+                oom_handled = True
+                # The control plane persists JobFailRequest.error as a string.
+                wc.fail_job(job_id, json.dumps({
+                    "code": "cuda_oom", "message": str(exc), "node_type": exc.node_type,
+                    "profile": args.profile, "vram_gb": vram_gb, "cleanup": cleanup,
+                }, ensure_ascii=False))
             except Exception as exc:  # noqa: BLE001 - isolate failed jobs and continue polling.
                 wc.fail_job(job_id, str(exc))
             finally:
                 last_work = time.time()
-                if not args.mock:
-                    try:
-                        httpx.post(f"{args.comfy_url}/free", json={"unload_models": False, "free_memory": True}, timeout=5)
-                    except httpx.RequestError as exc:
-                        print(f"ComfyUI memory cleanup unavailable: {exc}")
+                if not args.mock and not oom_handled:
+                    cleanup_comfy(args.comfy_url)
     finally:
         wc.stop_heartbeat()
+        wc.client.close()
 
 
 if __name__ == "__main__":
