@@ -57,6 +57,7 @@ export function isDemoProjectId(id: string): boolean {
 }
 
 const BACKEND_CACHE_TTL_MS = 10_000;
+const BACKEND_OFFLINE_CACHE_TTL_MS = 2_000;
 let cachedBackendOnline: { online: boolean; checkedAt: number } | null = null;
 let inflightBackendCheck: Promise<boolean> | null = null;
 
@@ -65,7 +66,12 @@ export async function checkBackendOnline(forceRefresh = false): Promise<boolean>
     return true;
   }
   const now = Date.now();
-  if (!forceRefresh && cachedBackendOnline && now - cachedBackendOnline.checkedAt < BACKEND_CACHE_TTL_MS) {
+  if (
+    !forceRefresh &&
+    cachedBackendOnline &&
+    now - cachedBackendOnline.checkedAt <
+      (cachedBackendOnline.online ? BACKEND_CACHE_TTL_MS : BACKEND_OFFLINE_CACHE_TTL_MS)
+  ) {
     return cachedBackendOnline.online;
   }
   if (!forceRefresh && inflightBackendCheck) {
@@ -106,6 +112,7 @@ async function requestJson<T>(path: string, init?: RequestInit): Promise<{ data:
     const errText = await res.text().catch(() => res.statusText);
     throw new ApiError(errText || `HTTP ${res.status}`, res.status);
   }
+  cachedBackendOnline = { online: true, checkedAt: Date.now() };
   const data = (await res.json()) as T;
   return { data, demo: false };
 }
@@ -134,7 +141,7 @@ export const api = {
   },
 
   async getProject(id: string): Promise<{ data: ProjectDetail; demo: boolean }> {
-    if (!(await checkBackendOnline())) {
+    if (isDemoProjectId(id) && !(await checkBackendOnline())) {
       const found = DEMO_PROJECTS.find((p) => p.id === id) ?? DEMO_PROJECTS[0];
       return { data: cloneData(found), demo: true };
     }

@@ -11,7 +11,7 @@ export async function GET() {
 
   try {
     const res = await fetch(`${base}/health`, {
-      signal: AbortSignal.timeout(500),
+      signal: AbortSignal.timeout(3000),
       cache: "no-store",
     });
     return NextResponse.json({ online: res.ok });
