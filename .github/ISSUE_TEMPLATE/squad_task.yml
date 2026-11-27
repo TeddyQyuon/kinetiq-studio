@@ -1,0 +1,44 @@
+name: Squad Engineering Task
+description: Scoped task for parallel AI squads (Codex Cloud / Antigravity)
+title: "[Squad] "
+labels: ["wave:1"]
+body:
+  - type: dropdown
+    id: squad
+    attributes:
+      label: Assigned Squad
+      options:
+        - "squad:contracts"
+        - "squad:control-plane"
+        - "squad:ai-director"
+        - "squad:workers"
+        - "squad:web-studio"
+        - "squad:qa-devops"
+    validations:
+      required: true
+  - type: dropdown
+    id: agent
+    attributes:
+      label: Recommended AI Team
+      options:
+        - "agent:codex (ChatGPT Business Codex Cloud)"
+        - "agent:antigravity (Antigravity + Git Worktree)"
+    validations:
+      required: true
+  - type: textarea
+    id: paths
+    attributes:
+      label: Allowed & Forbidden Paths
+      value: |
+        **Allowed Paths:**
+        - ...
+        **Forbidden Paths:**
+        - Any files outside the squad paths above (see `AGENTS.md`).
+    validations:
+      required: true
+  - type: textarea
+    id: spec
+    attributes:
+      label: Technical Specification & Acceptance Criteria
+    validations:
+      required: true

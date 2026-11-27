@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 import random
 import re
 import uuid
@@ -345,7 +344,6 @@ async def create_copilot_proposal(
     est_cu = 0.0
     affected: set[str] = set()
     for rc in raw_cmds[:25]:
-        cmd = TimelineCommand  # type: ignore[assignment]
         from pydantic import TypeAdapter
         parsed_cmd = TypeAdapter(TimelineCommand).validate_python(rc)
         temp_doc, cu = apply_command(temp_doc, parsed_cmd)

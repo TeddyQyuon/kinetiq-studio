@@ -1,0 +1,17 @@
+# Enterprise Squad Code Ownership
+* @TeddyQyuon
+
+/packages/contracts/            @TeddyQyuon
+/apps/api/app/core/             @TeddyQyuon
+/apps/api/app/identity/         @TeddyQyuon
+/apps/api/app/storage/          @TeddyQyuon
+/apps/api/app/jobs/             @TeddyQyuon
+/apps/api/app/events/           @TeddyQyuon
+/apps/api/app/director/         @TeddyQyuon
+/apps/api/app/qa/               @TeddyQyuon
+/apps/api/app/mcp/              @TeddyQyuon
+/workers/                       @TeddyQyuon
+/apps/web/                      @TeddyQyuon
+/packages/remotion-studio/      @TeddyQyuon
+/.github/                       @TeddyQyuon
+/infra/                         @TeddyQyuon

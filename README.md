@@ -12,6 +12,8 @@ An AI-directed, fault-tolerant educational video studio built for **native 1080p
 
 ## Documentation
 
+- [**AGENTS.md — Multi-Agent Engineering Constitution**](AGENTS.md)
+- [**30-Day Enterprise Multi-Squad Plan**](docs/ENTERPRISE_MULTI_AGENT_PLAN.md)
 - [**System Design Architecture (v1.1)**](docs/ARCHITECTURE.md)
 - [**Phase 0 Laptop Setup Guide**](docs/PHASE0_SETUP.md)
 - **Architecture Decision Records (`docs/adr/`):**

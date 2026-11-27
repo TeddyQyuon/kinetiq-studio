@@ -24,6 +24,11 @@ from app.workers.router import router as workers_router
 configure_logging()
 settings = get_settings()
 mcp_server = create_mcp_server()
+mcp_app = (
+    (mcp_server.streamable_http_app() if hasattr(mcp_server, "streamable_http_app") else mcp_server.http_app())
+    if mcp_server is not None
+    else None
+)
 
 
 @asynccontextmanager
@@ -33,7 +38,7 @@ async def lifespan(_app: FastAPI):
         bg_task = None
         if settings.run_embedded_orchestrator:
             bg_task = asyncio.create_task(orchestrator_loop(30))
-        if mcp_server is not None and hasattr(mcp_server, "session_manager"):
+        if mcp_app is not None and mcp_server is not None and hasattr(mcp_server, "session_manager"):
             await stack.enter_async_context(mcp_server.session_manager.run())
         try:
             yield
@@ -68,8 +73,7 @@ app.include_router(storage_router)
 app.include_router(exports_router)
 app.include_router(events_router)
 
-if mcp_server is not None:
-    mcp_app = mcp_server.streamable_http_app() if hasattr(mcp_server, "streamable_http_app") else mcp_server.http_app()
+if mcp_app is not None:
     app.mount("/mcp", mcp_app)
 
 
