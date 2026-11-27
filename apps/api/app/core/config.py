@@ -16,6 +16,7 @@ class Settings(BaseSettings):
 
     app_env: Literal["phase0_local", "phase0_docker", "phase1_vps"] = "phase0_local"
     run_embedded_orchestrator: bool = True
+    auto_export_draft_on_ready: bool = False
 
     database_url: str = "sqlite:///./kinetiq.db"
     redis_url: str = ""
