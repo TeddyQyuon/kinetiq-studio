@@ -1,0 +1,111 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://kinetiq.studio/schemas/timeline.v1.schema.json",
+  "title": "TimelineDocument",
+  "description": "Canonical declarative timeline contract shared between Next.js Editor, FastAPI Control Plane, AI Director, Remotion Renderer, and Antigravity MCP.",
+  "type": "object",
+  "required": ["schema_version", "project_id", "revision", "format", "style_bible", "voice", "tracks"],
+  "properties": {
+    "schema_version": { "type": "integer", "const": 1 },
+    "project_id": { "type": "string", "minLength": 1 },
+    "revision": { "type": "integer", "minimum": 1 },
+    "format": {
+      "type": "object",
+      "required": ["aspect", "fps", "target", "width", "height"],
+      "properties": {
+        "aspect": { "type": "string", "enum": ["9:16", "16:9"] },
+        "fps": { "type": "integer", "enum": [24, 30, 60] },
+        "target": { "type": "string", "enum": ["720p", "1080p", "4k"] },
+        "width": { "type": "integer", "minimum": 320 },
+        "height": { "type": "integer", "minimum": 320 }
+      }
+    },
+    "style_bible": {
+      "type": "object",
+      "required": ["palette", "look", "negative", "safe_zone"],
+      "properties": {
+        "palette": { "type": "array", "items": { "type": "string" }, "minItems": 1 },
+        "look": { "type": "string" },
+        "negative": { "type": "string" },
+        "safe_zone": { "type": "string", "enum": ["9x16_reels", "16x9_standard"] }
+      }
+    },
+    "voice": {
+      "type": "object",
+      "required": ["engine", "voice_id", "speed"],
+      "properties": {
+        "engine": { "type": "string", "enum": ["kokoro", "qwen3_tts"] },
+        "voice_id": { "type": "string" },
+        "speed": { "type": "number", "minimum": 0.7, "maximum": 1.4 }
+      }
+    },
+    "tracks": {
+      "type": "object",
+      "required": ["visual", "voice", "captions", "music", "overlays"],
+      "properties": {
+        "visual": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["id", "start_ms", "end_ms", "kind", "narration", "status"],
+            "properties": {
+              "id": { "type": "string" },
+              "start_ms": { "type": "integer", "minimum": 0 },
+              "end_ms": { "type": "integer", "minimum": 1 },
+              "kind": { "type": "string", "enum": ["ai_video", "diagram", "image_motion"] },
+              "narration": { "type": "string" },
+              "prompt": {
+                "type": "object",
+                "properties": {
+                  "ltx25": { "type": "string" },
+                  "wan22": { "type": "string" },
+                  "qwen_image": { "type": "string" }
+                }
+              },
+              "camera": { "type": "string" },
+              "model": { "type": "string" },
+              "seed": { "type": "integer" },
+              "template": { "type": "string", "enum": ["BarCompare", "StepBreakdown", "TimelineFlow", "StatCallout"] },
+              "props": { "type": "object" },
+              "assets": {
+                "type": "object",
+                "properties": {
+                  "keyframe": { "type": ["string", "null"] },
+                  "master": { "type": ["string", "null"] },
+                  "proxy": { "type": ["string", "null"] },
+                  "upscaled_4k": { "type": ["string", "null"] }
+                }
+              },
+              "qa": {
+                "type": "object",
+                "properties": {
+                  "score": { "type": ["number", "null"] },
+                  "attempts": { "type": "integer", "minimum": 0 },
+                  "verdict": { "type": "string" },
+                  "reason": { "type": ["string", "null"] }
+                }
+              },
+              "status": {
+                "type": "string",
+                "enum": [
+                  "planned",
+                  "generating_audio",
+                  "generating_keyframe",
+                  "qa_checking",
+                  "needs_review",
+                  "generating_clip",
+                  "ready",
+                  "failed"
+                ]
+              }
+            }
+          }
+        },
+        "voice": { "type": "array" },
+        "captions": { "type": "object" },
+        "music": { "type": "object" },
+        "overlays": { "type": "array" }
+      }
+    }
+  }
+}

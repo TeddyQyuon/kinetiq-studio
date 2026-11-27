@@ -1,0 +1,15 @@
+{
+  "name": "kinetiq-studio",
+  "version": "1.1.0",
+  "private": true,
+  "workspaces": [
+    "packages/contracts",
+    "packages/remotion-studio",
+    "apps/web"
+  ],
+  "scripts": {
+    "dev:web": "npm --workspace @kinetiq/web run dev",
+    "build": "npm --workspace @kinetiq/contracts run build && npm --workspace @kinetiq/web run build",
+    "typecheck": "npm --workspace @kinetiq/contracts run typecheck && npm --workspace @kinetiq/remotion-studio run typecheck && npm --workspace @kinetiq/web run typecheck"
+  }
+}

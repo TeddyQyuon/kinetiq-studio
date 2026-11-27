@@ -1,0 +1,40 @@
+# Dependencies & Virtual Environments
+node_modules/
+.venv/
+venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Next.js & Build Artifacts
+.next/
+out/
+dist/
+build/
+.turbo/
+
+# Environment & Secrets
+.env
+.env.*
+!.env.example
+
+# Databases, Local Vault & Media Cache
+*.db
+*.sqlite
+*.sqlite3
+apps/api/storage/
+storage/
+cache/
+*.mp4
+*.mov
+*.wav
+*.mp3
+*.safetensors
+*.gguf
+
+# OS / Editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/

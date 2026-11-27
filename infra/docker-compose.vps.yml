@@ -1,0 +1,38 @@
+# Phase 1 VPS Production Override
+# Usage: docker compose -f docker-compose.yml -f infra/docker-compose.vps.yml up -d --build
+
+services:
+  postgres:
+    ports: !reset []
+
+  redis:
+    ports: !reset []
+
+  api:
+    ports: !reset []
+    environment:
+      APP_ENV: phase1_vps
+
+  web:
+    ports: !reset []
+
+  caddy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    depends_on:
+      - web
+      - api
+    ports:
+      - "80:80"
+      - "443:443"
+    environment:
+      STUDIO_DOMAIN: ${STUDIO_DOMAIN:-studio.example.com}
+      API_DOMAIN: ${API_DOMAIN:-api.example.com}
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+
+volumes:
+  caddy_data:
+  caddy_config:

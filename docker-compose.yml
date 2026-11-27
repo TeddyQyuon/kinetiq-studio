@@ -1,0 +1,113 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
+      POSTGRES_DB: kinetiq
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  api:
+    build:
+      context: ./apps/api
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      APP_ENV: ${APP_ENV:-phase0_docker}
+      RUN_EMBEDDED_ORCHESTRATOR: "false"
+      DATABASE_URL: postgresql+psycopg://postgres:${POSTGRES_PASSWORD:-postgres}@postgres:5432/kinetiq
+      REDIS_URL: redis://redis:6379/0
+      STORAGE_PROVIDER: ${STORAGE_PROVIDER:-local}
+      LOCAL_VAULT_DIR: /data/vault
+      ENCRYPTION_MASTER_KEY: ${ENCRYPTION_MASTER_KEY:-dev-only-32-byte-base64-key-change-before-prod}
+      SESSION_SECRET: ${SESSION_SECRET:-dev-only-session-secret-change-me}
+      MEDIA_SIGNING_SECRET: ${MEDIA_SIGNING_SECRET:-dev-only-media-hmac-secret-change-me}
+      MCP_ACCESS_TOKEN: ${MCP_ACCESS_TOKEN:-}
+      GOOGLE_CLIENT_ID: ${GOOGLE_CLIENT_ID:-}
+      GOOGLE_CLIENT_SECRET: ${GOOGLE_CLIENT_SECRET:-}
+      GOOGLE_REDIRECT_URI: ${GOOGLE_REDIRECT_URI:-http://localhost:8000/v1/auth/google/callback}
+      GEMINI_API_KEY: ${GEMINI_API_KEY:-}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      PUBLIC_API_URL: ${PUBLIC_API_URL:-http://localhost:8000}
+      PUBLIC_WEB_URL: ${PUBLIC_WEB_URL:-http://localhost:3000}
+      CORS_ORIGINS: ${CORS_ORIGINS:-["http://localhost:3000","http://127.0.0.1:3000"]}
+    ports:
+      - "8000:8000"
+    volumes:
+      - vault_storage:/data/vault
+
+  orchestrator:
+    build:
+      context: ./apps/api
+      dockerfile: Dockerfile
+    command: ["python", "-m", "app.orchestrator"]
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      APP_ENV: ${APP_ENV:-phase0_docker}
+      DATABASE_URL: postgresql+psycopg://postgres:${POSTGRES_PASSWORD:-postgres}@postgres:5432/kinetiq
+      REDIS_URL: redis://redis:6379/0
+      STORAGE_PROVIDER: ${STORAGE_PROVIDER:-local}
+      LOCAL_VAULT_DIR: /data/vault
+      ENCRYPTION_MASTER_KEY: ${ENCRYPTION_MASTER_KEY:-dev-only-32-byte-base64-key-change-before-prod}
+      SESSION_SECRET: ${SESSION_SECRET:-dev-only-session-secret-change-me}
+      MEDIA_SIGNING_SECRET: ${MEDIA_SIGNING_SECRET:-dev-only-media-hmac-secret-change-me}
+      GEMINI_API_KEY: ${GEMINI_API_KEY:-}
+      GOOGLE_CLIENT_ID: ${GOOGLE_CLIENT_ID:-}
+      GOOGLE_CLIENT_SECRET: ${GOOGLE_CLIENT_SECRET:-}
+    volumes:
+      - vault_storage:/data/vault
+
+  web:
+    build:
+      context: ./apps/web
+      dockerfile: Dockerfile
+      args:
+        NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL:-http://localhost:8000}
+    restart: unless-stopped
+    depends_on:
+      - api
+    environment:
+      NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL:-http://localhost:8000}
+    ports:
+      - "3000:3000"
+
+  tunnel:
+    image: cloudflare/cloudflared:latest
+    profiles: ["tunnel"]
+    command: ["tunnel", "--no-autoupdate", "--url", "http://api:8000"]
+    depends_on:
+      - api
+
+volumes:
+  postgres_data:
+  vault_storage:
