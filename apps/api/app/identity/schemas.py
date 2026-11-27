@@ -4,6 +4,7 @@ from pydantic import BaseModel
 
 
 class UserStatusResponse(BaseModel):
+    csrf_token: str | None = None
     user_id: str
     email: str
     display_name: str

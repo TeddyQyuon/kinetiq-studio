@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import secrets
+import time
 from datetime import datetime, timedelta, timezone
 from urllib.parse import urlencode
 
@@ -12,6 +13,7 @@ from sqlalchemy.orm import Session
 from app.core.config import get_settings
 from app.core.crypto import decrypt_secret, encrypt_secret
 from app.core.errors import UnauthorizedError
+from app.identity.cookies import PKCE, PKCE_TTL, seal, unseal
 from app.models import OAuthCredential, User
 
 GOOGLE_AUTH_URL = "https://accounts.google.com/o/oauth2/v2/auth"
@@ -19,8 +21,8 @@ GOOGLE_TOKEN_URL = "https://oauth2.googleapis.com/token"
 GOOGLE_USERINFO_URL = "https://www.googleapis.com/oauth2/v3/userinfo"
 GOOGLE_SCOPES = "openid email https://www.googleapis.com/auth/drive.file"
 
-# In-memory PKCE verifier store for Phase 0; short-lived state -> (verifier, created_at)
-_PKCE_STATE_STORE: dict[str, tuple[str, datetime]] = {}
+# Local Studio starts OAuth with a cross-origin, credential-free fetch.
+_local_oauth: dict[str, tuple[float, str]] = {}
 
 
 def ensure_default_owner(db: Session) -> User:
@@ -38,7 +40,7 @@ def ensure_default_owner(db: Session) -> User:
     return user
 
 
-def start_google_oauth() -> tuple[str, str]:
+def start_google_oauth() -> tuple[str, str, str]:
     settings = get_settings()
     if not settings.google_client_id or not settings.google_client_secret:
         raise UnauthorizedError("GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET are not configured in .env")
@@ -46,7 +48,15 @@ def start_google_oauth() -> tuple[str, str]:
     state = secrets.token_urlsafe(24)
     verifier = secrets.token_urlsafe(48)
     challenge = base64.urlsafe_b64encode(hashlib.sha256(verifier.encode("ascii")).digest()).rstrip(b"=").decode("ascii")
-    _PKCE_STATE_STORE[state] = (verifier, datetime.now(timezone.utc))
+    cookie = ""
+    if settings.app_env == "phase1_vps":
+        cookie = seal(PKCE, f"{state}.{verifier}", PKCE_TTL)
+    else:
+        now = time.monotonic()
+        for expired, (deadline, _) in list(_local_oauth.items()):
+            if deadline <= now:
+                _local_oauth.pop(expired, None)
+        _local_oauth[state] = (now + PKCE_TTL, verifier)
 
     params = {
         "client_id": settings.google_client_id,
@@ -60,15 +70,19 @@ def start_google_oauth() -> tuple[str, str]:
         "code_challenge": challenge,
         "code_challenge_method": "S256",
     }
-    return f"{GOOGLE_AUTH_URL}?{urlencode(params)}", state
+    return f"{GOOGLE_AUTH_URL}?{urlencode(params)}", state, cookie
 
 
-async def complete_google_oauth(db: Session, code: str, state: str) -> User:
+async def complete_google_oauth(db: Session, code: str, state: str, cookie: str) -> OAuthCredential:
     settings = get_settings()
-    entry = _PKCE_STATE_STORE.pop(state, None)
-    if not entry:
-        raise UnauthorizedError("Invalid or expired OAuth state parameter")
-    verifier, _ = entry
+    if settings.app_env == "phase1_vps":
+        expected, verifier = unseal(PKCE, cookie).split(".", 1)
+        if not state.isascii() or not secrets.compare_digest(expected, state):
+            raise UnauthorizedError("Invalid OAuth state parameter")
+    else:
+        deadline, verifier = _local_oauth.pop(state, (0, ""))
+        if deadline <= time.monotonic():
+            raise UnauthorizedError("Invalid or expired OAuth state parameter")
 
     async with httpx.AsyncClient(timeout=20) as client:
         tok_resp = await client.post(
@@ -97,6 +111,19 @@ async def complete_google_oauth(db: Session, code: str, state: str) -> User:
         profile = ui_resp.json()
 
     user = ensure_default_owner(db)
+    if settings.app_env == "phase1_vps":
+        sub = profile.get("sub")
+        if user.google_sub:
+            allowed = user.google_sub == sub
+        else:
+            email = (profile.get("email") or "").casefold()
+            allowed = (
+                bool(sub and email)
+                and profile.get("email_verified") is True
+                and email == settings.owner_google_email.casefold()
+            )
+        if not allowed:
+            raise UnauthorizedError("Google account is not the configured studio owner")
     user.email = profile.get("email", user.email)
     user.google_sub = profile.get("sub")
     user.display_name = profile.get("name", user.display_name)
@@ -128,8 +155,8 @@ async def complete_google_oauth(db: Session, code: str, state: str) -> User:
         db.add(cred)
 
     db.commit()
-    db.refresh(user)
-    return user
+    db.refresh(cred)
+    return cred
 
 
 def has_google_drive_connected(db: Session, user_id: str) -> bool:
@@ -152,7 +179,10 @@ async def get_valid_google_access_token(db: Session, user_id: str) -> str:
         raise UnauthorizedError("Google Drive is not connected yet. Connect via /v1/auth/google/start.")
 
     now = datetime.now(timezone.utc)
-    if cred.encrypted_access_token and cred.expires_at and cred.expires_at > now + timedelta(seconds=90):
+    expiry = cred.expires_at
+    if expiry and expiry.tzinfo is None:  # SQLite returns naive UTC timestamps
+        expiry = expiry.replace(tzinfo=timezone.utc)
+    if cred.encrypted_access_token and expiry and expiry > now + timedelta(seconds=90):
         return decrypt_secret(cred.encrypted_access_token)
 
     refresh_token = decrypt_secret(cred.encrypted_refresh_token)

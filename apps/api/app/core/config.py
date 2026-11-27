@@ -3,7 +3,7 @@ from __future__ import annotations
 from functools import lru_cache
 from typing import Literal
 
-from pydantic import Field
+from pydantic import Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -14,7 +14,7 @@ class Settings(BaseSettings):
         extra="ignore",
     )
 
-    app_env: str = "phase0_local"
+    app_env: Literal["phase0_local", "phase0_docker", "phase1_vps"] = "phase0_local"
     run_embedded_orchestrator: bool = True
 
     database_url: str = "sqlite:///./kinetiq.db"
@@ -26,7 +26,12 @@ class Settings(BaseSettings):
     mcp_access_token: str = ""
 
     storage_provider: Literal["local", "drive"] = "local"
+    vault_reconcile_interval_seconds: int = Field(default=300, gt=0)
     local_vault_dir: str = "./storage/vault"
+
+    owner_google_email: str = ""
+    worker_rate_limit: int = Field(default=120, gt=0)
+    worker_rate_window_seconds: int = Field(default=60, gt=0)
 
     google_client_id: str = ""
     google_client_secret: str = ""
@@ -47,6 +52,14 @@ class Settings(BaseSettings):
     public_api_url: str = "http://localhost:8000"
     public_web_url: str = "http://localhost:3000"
     cors_origins: list[str] = Field(default_factory=lambda: ["http://localhost:3000", "http://127.0.0.1:3000"])
+
+    @model_validator(mode="after")
+    def require_vps_secret(self):
+        if self.app_env == "phase1_vps" and (
+            len(self.session_secret) < 32 or self.session_secret.startswith("dev-only")
+        ):
+            raise ValueError("Set SESSION_SECRET to a random secret of at least 32 characters for phase1_vps")
+        return self
 
 
 @lru_cache
