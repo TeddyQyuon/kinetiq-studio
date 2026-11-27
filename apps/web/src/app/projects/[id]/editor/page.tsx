@@ -32,7 +32,7 @@ import type {
   TimelineCommand,
   TimelineDocument,
 } from "@kinetiq/contracts";
-import { ApiError, api } from "@/lib/api-client";
+import { ApiError, api, type MusicPreset } from "@/lib/api-client";
 import {
   clearOpfsProxyCache,
   getOpfsCacheStats,
@@ -41,6 +41,8 @@ import {
 } from "@/lib/opfs-proxy-cache";
 import { useProjectEvents } from "@/lib/use-project-events";
 import { useEditorStore } from "@/stores/editor-store";
+import { AudioInspector, CaptionInspector, inspectorButton } from "./TrackInspector";
+import { RevisionDrawer } from "./RevisionDrawer";
 import { StatusBadge } from "@/components/StatusBadge";
 
 interface TrimDragState {
@@ -89,11 +91,12 @@ function makeUniqueSplitId(baseId: string, existingIds: Set<string>): string {
 
 export default function VideoEditorPage() {
   const params = useParams<{ id: string }>();
-  const projectId = params.id;
+  return <ProjectEditor key={params.id} projectId={params.id} />;
+}
 
+function ProjectEditor({ projectId }: { projectId: string }) {
   const {
     document,
-    serverRevision,
     mediaUrls,
     opfsCachedAssets,
     selectedSceneId,
@@ -126,7 +129,14 @@ export default function VideoEditorPage() {
     clearOpfsCachedAssets,
   } = useEditorStore();
 
-  const [serverBaseDoc, setServerBaseDoc] = useState<TimelineDocument | null>(null);
+  const [inspector, setInspector] = useState<"Scene" | "Audio & Music" | "Captions & Overlays">("Scene");
+  const [historyOpen, setHistoryOpen] = useState(false);
+  const [notice, setNotice] = useState("");
+  const [draftReview, setDraftReview] = useState("");
+  const [mediaBusy, setMediaBusy] = useState(false);
+  const [loadError, setLoadError] = useState("");
+  const mediaBusyRef = useRef(false);
+  const mounted = useRef(false);
   const [chatInput, setChatInput] = useState("");
   const [chatBusy, setChatBusy] = useState(false);
   const [confirmSpend, setConfirmSpend] = useState(false);
@@ -148,17 +158,20 @@ export default function VideoEditorPage() {
   // Initial load with crash-safe IndexedDB draft restoration
   useEffect(() => {
     let active = true;
+    mounted.current = true;
     pendingOpsRef.current = [];
     api.getProject(projectId).then((res) => {
       if (!active) return;
-      setServerBaseDoc(res.data.timeline);
-      void hydrateWithAutosave(res.data.id, res.data.timeline, res.data.media_urls, res.demo);
+      return hydrateWithAutosave(res.data.id, res.data.timeline, res.data.media_urls, res.demo, () => active);
+    }).catch((err: unknown) => {
+      if (active) setLoadError(err instanceof Error ? err.message : "Could not load this project.");
     });
     void getOpfsCacheStats().then((stats) => {
       if (active) setOpfsStats(stats);
     });
     return () => {
       active = false;
+      mounted.current = false;
       pendingOpsRef.current = [];
     };
   }, [projectId, hydrateWithAutosave]);
@@ -184,11 +197,13 @@ export default function VideoEditorPage() {
       applyLiveEvent(event);
       if ((event.event_type === "asset.synced" || event.event_type === "timeline.updated") && !isDemo) {
         void api.getProject(projectId).then((res) => {
-          setServerBaseDoc(res.data.timeline);
+          if (!mounted.current || res.demo || res.data.id !== projectId) return;
           mergeMediaUrls(res.data.media_urls);
-          if (!drainingOpsRef.current && pendingOpsRef.current.length === 0) {
+          if (!mediaBusyRef.current && !drainingOpsRef.current && pendingOpsRef.current.length === 0) {
             reconcileServerSnapshot(res.data.timeline);
           }
+        }).catch((err: unknown) => {
+          if (mounted.current) setNotice(err instanceof Error ? err.message : "Could not refresh the preview.");
         });
       }
     },
@@ -197,7 +212,7 @@ export default function VideoEditorPage() {
 
   const { status: sseStatus, lastEventId, reconnectNow } = useProjectEvents({
     projectId,
-    enabled: !isDemo && Boolean(document),
+    enabled: !isDemo && document?.project_id === projectId,
     onEvent: handleLiveEvent,
   });
 
@@ -264,7 +279,7 @@ export default function VideoEditorPage() {
   );
 
   const drainWriteQueue = useCallback(async () => {
-    if (drainingOpsRef.current || isDemo) return;
+    if (drainingOpsRef.current || isDemo || mediaBusyRef.current) return;
     drainingOpsRef.current = true;
     try {
       while (pendingOpsRef.current.length > 0) {
@@ -274,8 +289,8 @@ export default function VideoEditorPage() {
         try {
           if (op.kind === "commands") {
             const updated = await api.applyCommands(projectId, expectedRev, op.commands);
+            if (!mounted.current) return;
             pendingOpsRef.current.shift();
-            setServerBaseDoc(updated);
             if (pendingOpsRef.current.length === 0) {
               markSyncedFromServer(updated);
             } else {
@@ -291,8 +306,8 @@ export default function VideoEditorPage() {
             }
             await api.regenerateScene(projectId, op.sceneId, op.patch, expectedRev);
             const fresh = await api.getProject(projectId);
+            if (!mounted.current) return;
             pendingOpsRef.current.shift();
-            setServerBaseDoc(fresh.data.timeline);
             mergeMediaUrls(fresh.data.media_urls);
             if (pendingOpsRef.current.length === 0) {
               markSyncedFromServer(fresh.data.timeline);
@@ -306,8 +321,8 @@ export default function VideoEditorPage() {
               expectedRev,
               op.confirmSpend,
             );
+            if (!mounted.current) return;
             pendingOpsRef.current.shift();
-            setServerBaseDoc(updated);
             setPendingProposal(null);
             if (pendingOpsRef.current.length === 0) {
               markSyncedFromServer(updated);
@@ -316,6 +331,7 @@ export default function VideoEditorPage() {
             }
           }
         } catch (err) {
+          if (!mounted.current) return;
           if (err instanceof ApiError && err.status === 409) {
             setSyncState(
               "conflict",
@@ -374,8 +390,8 @@ export default function VideoEditorPage() {
   // Unified local + IndexedDB + serialized backend command commit
   const commitTimelineCommands = useCallback(
     async (commands: TimelineCommand[], label?: string) => {
-      if (!document || commands.length === 0) return;
-      dispatchLocalBatch(commands, label);
+      if (!document || commands.length === 0 || mediaBusyRef.current) return;
+      if (!dispatchLocalBatch(commands, label)) return;
       if (isDemo) return;
       enqueueCommandBatch(commands);
       await drainWriteQueue();
@@ -389,8 +405,8 @@ export default function VideoEditorPage() {
       patch: { prompt?: string; model?: ModelChoice; camera?: CameraPreset },
       label?: string,
     ) => {
-      if (!document) return;
-      dispatchLocalCommand({ type: "regenerate_clip", scene_id: sceneId, ...patch }, label);
+      if (!document || mediaBusyRef.current) return;
+      if (!dispatchLocalCommand({ type: "regenerate_clip", scene_id: sceneId, ...patch }, label)) return;
       if (isDemo) return;
       pendingOpsRef.current.push({ kind: "regenerate", sceneId, patch });
       await drainWriteQueue();
@@ -399,6 +415,7 @@ export default function VideoEditorPage() {
   );
 
   const handleUndo = useCallback(async () => {
+    if (mediaBusyRef.current) return;
     const cmds = undo();
     if (!cmds || isDemo) return;
     enqueueCommandBatch(cmds);
@@ -406,6 +423,7 @@ export default function VideoEditorPage() {
   }, [drainWriteQueue, enqueueCommandBatch, isDemo, undo]);
 
   const handleRedo = useCallback(async () => {
+    if (mediaBusyRef.current) return;
     const cmds = redo();
     if (!cmds || isDemo) return;
     enqueueCommandBatch(cmds);
@@ -453,17 +471,20 @@ export default function VideoEditorPage() {
     selectScene(newSceneId);
   }, [activeSceneAtPlayhead, commitTimelineCommands, document, playheadMs, selectScene]);
 
-  // Global keyboard shortcuts (Ctrl/Cmd+Z, Ctrl/Cmd+Shift+Z, Ctrl+Y, S)
+  // Keyboard editing and transport share the same handlers as the toolbar.
   useEffect(() => {
     const onKeyDown = (e: KeyboardEvent) => {
       const target = e.target as HTMLElement | null;
       const tag = target?.tagName;
-      if (tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT" || target?.isContentEditable) {
+      if (e.defaultPrevented || e.repeat || historyOpen || mediaBusyRef.current || tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT" || target?.isContentEditable) {
         return;
       }
 
       const mod = e.metaKey || e.ctrlKey;
-      if (mod && e.key.toLowerCase() === "z" && !e.shiftKey) {
+      if (!mod && e.code === "Space" && !e.altKey) {
+        e.preventDefault();
+        playerRef.current?.toggle();
+      } else if (mod && e.key.toLowerCase() === "z" && !e.shiftKey) {
         e.preventDefault();
         void handleUndo();
       } else if (
@@ -474,13 +495,16 @@ export default function VideoEditorPage() {
         void handleRedo();
       } else if (!mod && e.key.toLowerCase() === "s") {
         e.preventDefault();
-        void handleSplitAtPlayhead();
+        if (selectedScene && selectedScene.id === activeSceneAtPlayhead?.id &&
+            playheadMs >= selectedScene.start_ms + 500 && playheadMs <= selectedScene.end_ms - 500) {
+          void handleSplitAtPlayhead();
+        }
       }
     };
 
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
-  }, [handleRedo, handleSplitAtPlayhead, handleUndo]);
+  }, [activeSceneAtPlayhead, handleRedo, handleSplitAtPlayhead, handleUndo, historyOpen, playheadMs, selectedScene]);
 
   // Edge-trim pointer drag handlers
   useEffect(() => {
@@ -537,21 +561,27 @@ export default function VideoEditorPage() {
     };
   }, [commitTimelineCommands, trimDrag]);
 
-  async function handleAskCopilot(e: React.FormEvent) {
-    e.preventDefault();
-    if (!chatInput.trim() || !document) return;
+  async function askCopilot(message: string) {
+    if (!message || !document || chatBusy) return;
     setChatBusy(true);
     try {
-      const proposal = await api.copilotChat(projectId, chatInput.trim(), selectedSceneId);
-      setPendingProposal(proposal);
-      setChatInput("");
+      const proposal = await api.copilotChat(projectId, message, selectedSceneId);
+      if (!mounted.current) return;
+      if (message === "review_draft" || !proposal.commands.length) {
+        setDraftReview(proposal.assistant_message);
+      } else {
+        setPendingProposal(proposal);
+      }
+      if (message !== "review_draft") setChatInput("");
+    } catch (err) {
+      setNotice(err instanceof Error ? err.message : "Could not reach Copilot.");
     } finally {
       setChatBusy(false);
     }
   }
 
   async function handleAcceptProposal() {
-    if (!document || !pendingProposal) return;
+    if (!document || !pendingProposal || mediaBusyRef.current || drainingOpsRef.current) return;
     const needsSpendConfirm = pendingProposal.requires_confirmation || pendingProposal.est_cu > 1.0;
     if (needsSpendConfirm && !confirmSpend) return;
 
@@ -575,7 +605,7 @@ export default function VideoEditorPage() {
         `Edit ${selectedScene.id}`,
       );
     }
-    if (promptDraft && promptDraft !== (selectedScene.prompt?.ltx25 ?? "")) {
+    if (selectedScene.kind !== "diagram" && promptDraft && promptDraft !== (selectedScene.prompt?.ltx25 ?? selectedScene.prompt?.qwen_image ?? "")) {
       await triggerSceneRegeneration(
         selectedScene.id,
         { prompt: promptDraft },
@@ -614,12 +644,12 @@ export default function VideoEditorPage() {
   }
 
   async function handleSyncDraftToServer() {
-    if (!document || isDemo) return;
+    if (!document || drainingOpsRef.current || mediaBusyRef.current) return;
     setSyncState("syncing", null);
     if (pendingOpsRef.current.length > 0) {
       try {
         const latest = await api.getProject(projectId);
-        setServerBaseDoc(latest.data.timeline);
+        if (!mounted.current) return;
         mergeMediaUrls(latest.data.media_urls);
         advanceServerRevision(latest.data.timeline.revision);
         await drainWriteQueue();
@@ -632,7 +662,7 @@ export default function VideoEditorPage() {
     const baseRev = useEditorStore.getState().serverRevision;
     try {
       const updated = await api.putTimeline(projectId, baseRev, document);
-      setServerBaseDoc(updated);
+      if (!mounted.current) return;
       markSyncedFromServer(updated);
     } catch (err) {
       if (err instanceof ApiError && err.status === 409) {
@@ -647,15 +677,15 @@ export default function VideoEditorPage() {
   }
 
   async function handleDiscardDraft() {
-    pendingOpsRef.current = [];
-    if (!isDemo) {
+    if (drainingOpsRef.current || mediaBusyRef.current) return;
+    try {
       const fresh = await api.getProject(projectId);
-      setServerBaseDoc(fresh.data.timeline);
+      if (!mounted.current) return;
+      pendingOpsRef.current = [];
+      mergeMediaUrls(fresh.data.media_urls);
       await discardLocalDraft(fresh.data.timeline);
-      return;
-    }
-    if (serverBaseDoc) {
-      await discardLocalDraft(serverBaseDoc);
+    } catch (err) {
+      setNotice(err instanceof Error ? err.message : "Could not reload the project.");
     }
   }
 
@@ -666,6 +696,100 @@ export default function VideoEditorPage() {
     setOpfsStats(stats);
   }
 
+  async function addScene(kind: "ai_video" | "diagram") {
+    if (!document || mediaBusyRef.current) return;
+    const id = `scn_${crypto.randomUUID()}`;
+    const start = document.tracks.visual.at(-1)?.end_ms ?? 0;
+    const command: TimelineCommand = kind === "diagram"
+      ? { type: "insert_diagram", at_ms: start, duration_ms: 4000, scene_id: id,
+          narration: "", template: "StatCallout", props: { title: "New diagram" } }
+      : { type: "restore_scene", index: document.tracks.visual.length, scene: {
+          id, start_ms: start, end_ms: start + 4000, narration: "", kind,
+          model: "ltx25_fp8", camera: "slow_dolly_in", status: "planned" } };
+    await commitTimelineCommands([command], kind === "diagram" ? "Add diagram scene" : "Add AI scene");
+    selectScene(id);
+    setInspector("Scene");
+  }
+
+  async function runMediaAction(action: (doc: TimelineDocument, revision: number) => Promise<{
+    timeline?: TimelineDocument;
+    urls?: Record<string, string>;
+    restored?: boolean;
+    message?: string;
+  }>) {
+    const state = useEditorStore.getState();
+    if (!state.document || mediaBusyRef.current) return;
+    if (drainingOpsRef.current || pendingOpsRef.current.length || (!isDemo && state.dirty)) {
+      setNotice("Sync the current timeline edits before changing project media or restoring a revision.");
+      return;
+    }
+    mediaBusyRef.current = true;
+    setMediaBusy(true);
+    setNotice("");
+    try {
+      const result = await action(state.document, state.serverRevision);
+      if (!mounted.current) return;
+      if (result.urls) mergeMediaUrls(result.urls);
+      if (result.timeline) {
+        if (result.restored) {
+          await discardLocalDraft(result.timeline);
+          if (!mounted.current) return;
+          setHistoryOpen(false);
+          setDraftReview("");
+        }
+        markSyncedFromServer(result.timeline);
+      }
+      if (result.message) setNotice(result.message);
+    } catch (err) {
+      setNotice(err instanceof Error ? err.message : "The project could not be updated.");
+    } finally {
+      mediaBusyRef.current = false;
+      if (mounted.current) setMediaBusy(false);
+    }
+  }
+
+  function changeMusic(source: File | MusicPreset | null) {
+    void runMediaAction(async (doc, revision) => {
+      const opts = { volume: doc.tracks.music.volume, duck_db: doc.tracks.music.duck_db };
+      if (source === null) return { timeline: await api.removeMusic(projectId, revision) };
+      if (source instanceof File && source.size > 25 * 1024 * 1024) {
+        throw new Error("Music files must be at most 25 MiB.");
+      }
+      const result = typeof source === "string"
+        ? await api.applyMusicPreset(projectId, source, opts, revision)
+        : await api.uploadMusicFile(projectId, source, opts, revision);
+      return { timeline: result.timeline, urls: { [result.asset_id]: result.media_url } };
+    });
+  }
+
+  function changeVoice(voiceId: string) {
+    void runMediaAction(async (doc, revision) => {
+      const next = { ...doc, voice: { ...doc.voice, engine: "kokoro" as const, voice_id: voiceId } };
+      return { timeline: await api.putTimeline(projectId, revision, next) };
+    });
+  }
+
+  function revoice(sceneId: string) {
+    void runMediaAction(async (_doc, revision) => {
+      const queued = await api.revoiceScene(projectId, sceneId, revision);
+      if (!queued.ok) return { message: "Connect a media worker to generate this voiceover." };
+      const fresh = await api.getProject(projectId);
+      return { timeline: fresh.data.timeline, urls: fresh.data.media_urls, message: "Voiceover and word alignment queued." };
+    });
+  }
+
+  function restoreRevision(revision: number) {
+    void runMediaAction(async (_doc, expected) => {
+      const latest = await api.getProject(projectId);
+      if (latest.data.timeline.revision !== expected) {
+        reconcileServerSnapshot(latest.data.timeline);
+        throw new Error("The timeline changed. Review its latest revision before restoring.");
+      }
+      const timeline = await api.restoreRevision(projectId, revision, expected);
+      return { timeline, urls: latest.data.media_urls, restored: true, message: `Restored revision ${revision}.` };
+    });
+  }
+
   function scrubFromRulerPointer(clientX: number) {
     const rect = rulerRef.current?.getBoundingClientRect();
     if (!rect || rect.width <= 0) return;
@@ -673,7 +797,8 @@ export default function VideoEditorPage() {
     seekToMs(ratio * totalMs);
   }
 
-  if (!document) {
+  if (loadError) return <p role="alert" className="p-8 text-sm">{loadError}</p>;
+  if (!document || document.project_id !== projectId) {
     return <div className="p-8 text-sm text-zinc-400">Loading browser timeline editor...</div>;
   }
 
@@ -723,7 +848,7 @@ export default function VideoEditorPage() {
   const rulerSteps = Math.max(2, Math.min(12, Math.floor(totalMs / 5000) + 1));
 
   return (
-    <div className="flex h-screen flex-col bg-[#09090b]">
+    <div className="flex min-h-screen flex-col lg:h-screen bg-[#09090b]">
       {/* Top Toolbar */}
       <header className="flex flex-wrap items-center justify-between gap-3 border-b border-zinc-800 bg-[#0d0e12] px-4 py-2.5">
         <div className="flex flex-wrap items-center gap-2.5">
@@ -765,10 +890,10 @@ export default function VideoEditorPage() {
           )}
 
           {/* Sync / Conflict Controls */}
-          {syncStatus === "conflict" && (
+          {(syncStatus === "conflict" || (!isDemo && dirty && (syncStatus === "offline" || restoredFromDraft))) && (
             <div className="inline-flex items-center gap-1.5 rounded-full border border-rose-500/40 bg-rose-500/15 px-2.5 py-0.5 text-[11px] text-rose-200">
               <AlertTriangle className="h-3 w-3" />
-              <span>{syncError ?? "Revision conflict"}</span>
+              <span>{syncError ?? "Unsynced draft"}</span>
               <button
                 type="button"
                 onClick={handleSyncDraftToServer}
@@ -792,7 +917,8 @@ export default function VideoEditorPage() {
           )}
         </div>
 
-        <div className="flex items-center gap-2">
+        <div className="flex flex-wrap items-center gap-2">
+          <button className={inspectorButton} onClick={() => { setNotice(""); setHistoryOpen(true); }}>Revision History</button>
           <button
             type="button"
             onClick={() => void handleUndo()}
@@ -823,6 +949,11 @@ export default function VideoEditorPage() {
         </div>
       </header>
 
+      {notice && !historyOpen && <div role="status" className="flex items-center justify-between gap-3 bg-zinc-800 px-4 py-2 text-xs">
+        {notice}<button onClick={() => setNotice("")} aria-label="Dismiss message"><X size={14} /></button>
+      </div>}
+      {historyOpen && <RevisionDrawer projectId={projectId} revision={document.revision} busy={mediaBusy}
+        notice={notice} close={() => setHistoryOpen(false)} restore={restoreRevision} />}
       {/* Main 3-Pane Studio */}
       <div className="grid flex-1 min-h-0 grid-cols-1 lg:grid-cols-12">
         {/* Left: Scene List & Inspector */}
@@ -830,6 +961,10 @@ export default function VideoEditorPage() {
           <div className="flex items-center justify-between border-b border-zinc-800 px-3 py-2 text-xs font-semibold uppercase tracking-wider text-zinc-400">
             <span>Scenes ({document.tracks.visual.length})</span>
             <span className="text-[10px] font-normal normal-case text-zinc-500">Drag to reorder</span>
+          </div>
+          <div className="flex flex-wrap gap-1.5 px-2.5 pt-2">
+            <button className={inspectorButton} onClick={() => void addScene("diagram")}>+ Add Diagram Scene</button>
+            <button className={inspectorButton} onClick={() => void addScene("ai_video")}>+ Add AI Scene</button>
           </div>
           <div className="space-y-1.5 p-2.5">
             {document.tracks.visual.map((s, idx) => {
@@ -916,8 +1051,47 @@ export default function VideoEditorPage() {
               );
             })}
           </div>
+        </div>
 
-          {selectedScene && (
+        {/* Center: @remotion/player Preview Stage */}
+        <div className="lg:col-span-6 flex flex-col items-center justify-center bg-[#09090b] p-4 min-h-[300px] min-w-0">
+          <div
+            className="relative flex items-center justify-center overflow-hidden rounded-xl border border-zinc-800 bg-black shadow-2xl"
+            style={{
+              width: "100%",
+              maxWidth: document.format.aspect === "9:16" ? 290 : 700,
+              aspectRatio: document.format.aspect === "9:16" ? "9 / 16" : "16 / 9",
+            }}
+          >
+            <Player
+              ref={playerRef}
+              component={EduComposition}
+              inputProps={{ document, mediaUrls: effectiveMediaUrls }}
+              durationInFrames={durationInFrames}
+              compositionWidth={document.format.width}
+              compositionHeight={document.format.height}
+              fps={fps}
+              controls
+              spaceKeyToPlayOrPause={false}
+              style={{ width: "100%", height: "100%" }}
+            />
+          </div>
+          <div className="mt-2 text-[11px] text-zinc-500">
+            Unified Remotion Engine — browser preview matches final {document.format.target.toUpperCase()} export 1:1
+          </div>
+        </div>
+
+        {/* Right: AI Editing Copilot */}
+        <div className="lg:col-span-3 flex flex-col overflow-y-auto border-l border-zinc-800 bg-[#0d0e12] min-h-0">
+          <fieldset disabled={mediaBusy} className="shrink-0">
+            <div role="tablist" aria-label="Inspector" className="flex flex-wrap gap-1 border-b border-zinc-800 p-2">
+              {(["Scene", "Audio & Music", "Captions & Overlays"] as const).map((tab, index) => (
+                <button key={tab} role="tab" id={`inspector-tab-${index}`} aria-controls="inspector-content" aria-selected={tab === inspector}
+                  className={`${inspectorButton} aria-selected:border-amber-500 aria-selected:text-amber-200`} onClick={() => setInspector(tab)}>{tab}</button>
+              ))}
+            </div>
+            <section role="tabpanel" id="inspector-content" aria-labelledby={`inspector-tab-${["Scene", "Audio & Music", "Captions & Overlays"].indexOf(inspector)}`}>
+          {inspector === "Scene" && selectedScene && (
             <div className="mt-auto border-t border-zinc-800 p-3 space-y-2.5 bg-[#111216]">
               <div className="flex items-center justify-between">
                 <div className="text-xs font-semibold text-amber-300">
@@ -948,6 +1122,7 @@ export default function VideoEditorPage() {
 
               <textarea
                 rows={2}
+                aria-label="Scene narration"
                 value={narrationDraft}
                 onChange={(e) => setNarrationDraft(e.target.value)}
                 className="w-full rounded border border-zinc-700 bg-zinc-900 p-2 text-xs outline-none focus:border-amber-500"
@@ -989,6 +1164,7 @@ export default function VideoEditorPage() {
                 <>
                   <textarea
                     rows={2}
+                    aria-label="Visual prompt"
                     value={promptDraft}
                     onChange={(e) => setPromptDraft(e.target.value)}
                     className="w-full rounded border border-zinc-700 bg-zinc-900 p-2 text-xs outline-none focus:border-amber-500"
@@ -996,6 +1172,7 @@ export default function VideoEditorPage() {
                   />
                   <div className="grid grid-cols-2 gap-1.5">
                     <select
+                      aria-label="Scene model"
                       value={selectedScene.model ?? "ltx25_fp8"}
                       onChange={(e) =>
                         void triggerSceneRegeneration(
@@ -1011,6 +1188,7 @@ export default function VideoEditorPage() {
                       <option value="qwen_image">Qwen-Image</option>
                     </select>
                     <select
+                      aria-label="Scene camera"
                       value={selectedScene.camera ?? "slow_dolly_in"}
                       onChange={(e) =>
                         void triggerSceneRegeneration(
@@ -1039,45 +1217,31 @@ export default function VideoEditorPage() {
                 <RefreshCw className="h-3.5 w-3.5 text-amber-400" />
                 Apply Scene Edit
               </button>
+              <div className="flex flex-wrap gap-1.5">
+                <button className={inspectorButton} disabled={!selectedScene.narration.trim() || narrationDraft !== selectedScene.narration}
+                  title="Save the narration before re-voicing" onClick={() => revoice(selectedScene.id)}>Re-Voice Scene</button>
+                {selectedScene.kind !== "diagram" && <>
+                  <button className={inspectorButton} onClick={() => void triggerSceneRegeneration(selectedScene.id, { prompt: promptDraft || undefined }, "Re-roll scene")}>Re-roll</button>
+                  <button className={inspectorButton} onClick={() => void commitTimelineCommands([{ type: "convert_scene_to_diagram",
+                    scene_id: selectedScene.id, template: "StepBreakdown", props: { title: "Scene breakdown", steps: [selectedScene.narration] } }])}>Convert to Diagram</button>
+                </>}
+                <button className={inspectorButton} onClick={() => void commitTimelineCommands([{ type: "delete_scene", scene_id: selectedScene.id }], "Delete scene")}>Delete Scene</button>
+              </div>
             </div>
           )}
-        </div>
-
-        {/* Center: @remotion/player Preview Stage */}
-        <div className="lg:col-span-6 flex flex-col items-center justify-center bg-[#09090b] p-4 min-h-[300px] min-w-0">
-          <div
-            className="relative flex items-center justify-center overflow-hidden rounded-xl border border-zinc-800 bg-black shadow-2xl"
-            style={{
-              width: "100%",
-              maxWidth: document.format.aspect === "9:16" ? 290 : 700,
-              aspectRatio: document.format.aspect === "9:16" ? "9 / 16" : "16 / 9",
-            }}
-          >
-            <Player
-              ref={playerRef}
-              component={EduComposition}
-              inputProps={{ document, mediaUrls: effectiveMediaUrls }}
-              durationInFrames={durationInFrames}
-              compositionWidth={document.format.width}
-              compositionHeight={document.format.height}
-              fps={fps}
-              controls
-              style={{ width: "100%", height: "100%" }}
-            />
-          </div>
-          <div className="mt-2 text-[11px] text-zinc-500">
-            Unified Remotion Engine — browser preview matches final {document.format.target.toUpperCase()} export 1:1
-          </div>
-        </div>
-
-        {/* Right: AI Editing Copilot */}
-        <div className="lg:col-span-3 flex flex-col border-l border-zinc-800 bg-[#0d0e12] min-h-0">
+              {inspector === "Scene" && !selectedScene && <p className="p-3 text-xs">Add a scene to edit its narration and visuals.</p>}
+              {inspector === "Audio & Music" && <AudioInspector doc={document} changeVoice={changeVoice} setMusic={changeMusic}
+                removeMusic={() => changeMusic(null)} command={(cmd) => void commitTimelineCommands([cmd])} />}
+              {inspector === "Captions & Overlays" && <CaptionInspector doc={document} scene={selectedScene}
+                command={(cmd) => void commitTimelineCommands([cmd])} />}
+            </section>
+          </fieldset>
           <div className="flex items-center gap-2 border-b border-zinc-800 px-3.5 py-2.5 text-xs font-semibold text-amber-300">
             <Sparkles className="h-4 w-4" />
             AI Editing Copilot (Gemini + MCP)
           </div>
 
-          <div className="flex-1 space-y-3 overflow-y-auto p-3 text-xs">
+          <div className="space-y-3 p-3 text-xs">
             <div className="rounded-lg border border-zinc-800 bg-zinc-900/60 p-3 text-zinc-300">
               Ask me to tighten pauses, insert a native 4K chart, rewrite a narration beat, or re-roll a scene with a
               new camera move. Every edit shows a preview before applying.
@@ -1100,6 +1264,15 @@ export default function VideoEditorPage() {
               ))}
             </div>
 
+            <button className={inspectorButton} disabled={chatBusy || (!isDemo && dirty)} onClick={() => void askCopilot("review_draft")}>
+              Review Whole Draft
+            </button>
+            {draftReview && <section aria-label="Draft review" className="space-y-2 rounded-lg border border-cyan-800 bg-cyan-950/20 p-3">
+              {draftReview.split("\n").filter(Boolean).map((line, i) => {
+                const match = /^(Pacing|Hook retention|Diagram density):\s*(.*)$/i.exec(line);
+                return match ? <div key={i}><h3 className="font-semibold text-cyan-300">{match[1]}</h3><p>{match[2]}</p></div> : <p key={i}>{line}</p>;
+              })}
+            </section>}
             {pendingProposal && (
               <div className="space-y-2.5 rounded-xl border border-amber-500/40 bg-amber-500/10 p-3">
                 <div className="flex items-center gap-1.5 font-semibold text-amber-200">
@@ -1129,7 +1302,7 @@ export default function VideoEditorPage() {
                   <button
                     type="button"
                     onClick={handleAcceptProposal}
-                    disabled={needsSpendConfirm && !confirmSpend}
+                    disabled={mediaBusy || syncStatus === "syncing" || (needsSpendConfirm && !confirmSpend)}
                     className="inline-flex flex-1 items-center justify-center gap-1 rounded-lg bg-emerald-500 py-1.5 font-semibold text-zinc-950 hover:bg-emerald-400 disabled:opacity-40"
                   >
                     <Check className="h-3.5 w-3.5" />
@@ -1147,7 +1320,7 @@ export default function VideoEditorPage() {
             )}
           </div>
 
-          <form onSubmit={handleAskCopilot} className="border-t border-zinc-800 p-3 flex gap-2">
+          <form onSubmit={(e) => { e.preventDefault(); void askCopilot(chatInput.trim()); }} className="border-t border-zinc-800 p-3 flex gap-2">
             <input
               value={chatInput}
               onChange={(e) => setChatInput(e.target.value)}

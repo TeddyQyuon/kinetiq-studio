@@ -12,7 +12,7 @@ import {
   Settings,
   Sparkles,
 } from "lucide-react";
-import { api, type IdentityStatus } from "@/lib/api-client";
+import { api, AUTH_REQUIRED_EVENT, type IdentityStatus } from "@/lib/api-client";
 
 const NAV_ITEMS = [
   { href: "/", label: "Library", icon: FolderOpen },
@@ -28,24 +28,54 @@ export function StudioShell({ children }: { children: React.ReactNode }) {
   const [onlineWorkers, setOnlineWorkers] = useState(0);
   const [cuUsed, setCuUsed] = useState(0);
 
+  const [authRequired, setAuthRequired] = useState(false);
+  const [error, setError] = useState("");
+  const [connecting, setConnecting] = useState(false);
+  const [retry, setRetry] = useState(0);
+
   useEffect(() => {
     let active = true;
-    api.getIdentity().then((res) => {
-      if (!active) return;
-      setIdentity(res.data);
-      setIsDemo(res.demo);
-    });
-    api.listWorkers().then((res) => {
-      if (!active) return;
-      setOnlineWorkers(res.data.filter((w) => w.status !== "offline").length);
-      setCuUsed(
-        Number(res.data.reduce((acc, w) => acc + (w.cu_used_month || 0), 0).toFixed(1)),
-      );
-    });
+    const requireAuth = () => {
+      setAuthRequired(true);
+      setIsDemo(false);
+      setError("");
+      setCuUsed(0);
+      setOnlineWorkers(0);
+    };
+    window.addEventListener(AUTH_REQUIRED_EVENT, requireAuth);
+    (async () => {
+      try {
+        const session = await api.getIdentity();
+        if (!active) return;
+        setIdentity(session.data);
+        setIsDemo(session.demo);
+        setAuthRequired(Boolean(session.data.auth_required));
+        setError("");
+        if (session.data.auth_required) return;
+        const workers = await api.listWorkers();
+        if (!active) return;
+        setOnlineWorkers(workers.data.filter((w) => w.status !== "offline").length);
+        setCuUsed(Number(workers.data.reduce((acc, w) => acc + w.cu_used_month, 0).toFixed(1)));
+      } catch (err) {
+        if (active) setError(err instanceof Error ? err.message : "Could not load the workspace.");
+      }
+    })();
     return () => {
       active = false;
+      window.removeEventListener(AUTH_REQUIRED_EVENT, requireAuth);
     };
-  }, [pathname]);
+  }, [pathname, retry]);
+
+  async function signIn() {
+    setConnecting(true);
+    setError("");
+    try {
+      window.location.assign(await api.startGoogleDriveAuth());
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Could not start Google sign-in.");
+      setConnecting(false);
+    }
+  }
 
   const isEditorRoute = pathname?.includes("/editor");
 
@@ -112,14 +142,28 @@ export function StudioShell({ children }: { children: React.ReactNode }) {
               <span
                 className={`h-2 w-2 rounded-full ${isDemo ? "bg-amber-400" : "bg-emerald-400"}`}
               />
-              {isDemo ? "Demo Workspace (API Offline)" : "Control Plane Online"}
+              {authRequired ? "Owner sign-in required" : isDemo ? "Demo Workspace (API Offline)" : "Control Plane Online"}
             </span>
           </div>
         </div>
       </aside>
 
       <main className={`flex-1 ${isEditorRoute ? "overflow-hidden" : "overflow-y-auto"}`}>
-        {children}
+        {authRequired ? (
+          <section className="mx-auto mt-16 max-w-md rounded-xl border border-zinc-800 bg-zinc-900 p-6">
+            <h1 className="text-xl font-semibold">Sign in to Kinetiq Studio</h1>
+            <p className="mt-2 text-sm text-zinc-400">Use the Google account that owns this workspace.</p>
+            <button disabled={connecting} onClick={signIn} className="mt-5 rounded-lg bg-amber-400 px-4 py-2 text-sm font-semibold text-zinc-950">
+              {connecting ? "Opening Google…" : "Sign in with Google"}
+            </button>
+            {error && <p role="alert" className="mt-3 text-sm text-rose-300">{error}</p>}
+          </section>
+        ) : !identity ? (
+          <div role="status" className="p-6 text-sm text-zinc-400">
+            {error || "Opening workspace…"}
+            {error && <button className="ml-3 underline" onClick={() => setRetry(value => value + 1)}>Retry</button>}
+          </div>
+        ) : children}
       </main>
     </div>
   );

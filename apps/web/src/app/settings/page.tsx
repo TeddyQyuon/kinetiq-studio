@@ -5,21 +5,60 @@ import { CheckCircle2, HardDrive, Key, Plug, Sparkles } from "lucide-react";
 import { API_BASE, api, type IdentityStatus } from "@/lib/api-client";
 import { StatusBadge } from "@/components/StatusBadge";
 
+const mcpConfig = `{
+  "mcpServers": {
+    "kinetiq-studio": {
+      "url": "${API_BASE}/mcp",
+      "headers": { "Authorization": "Bearer <YOUR_MCP_ACCESS_TOKEN>" }
+    }
+  }
+}`;
+
 export default function SettingsPage() {
   const [identity, setIdentity] = useState<IdentityStatus | null>(null);
   const [isDemo, setIsDemo] = useState(false);
+
+  const [message, setMessage] = useState("");
+  const [busy, setBusy] = useState(false);
 
   useEffect(() => {
     api.getIdentity().then((res) => {
       setIdentity(res.data);
       setIsDemo(res.demo);
-    });
+    }).catch((err: Error) => setMessage(err.message));
   }, []);
 
   async function handleConnectDrive() {
-    if (isDemo) return;
-    const url = await api.startGoogleDriveAuth();
-    window.location.href = url;
+    if (isDemo || busy) return;
+    setBusy(true);
+    try {
+      window.location.assign(await api.startGoogleDriveAuth());
+    } catch (error) {
+      setBusy(false);
+      setMessage(error instanceof Error ? error.message : "Could not connect Google Drive.");
+    }
+  }
+
+  async function signOut() {
+    setBusy(true);
+    try {
+      await api.logout();
+      setIdentity(null);
+      window.location.reload();
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : "Could not sign out.");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function copyConfig() {
+    try {
+      await navigator.clipboard.writeText(mcpConfig);
+      setMessage("MCP config copied.");
+    } catch {
+      setMessage("Copy is unavailable. Select the configuration below to copy it manually.");
+    }
   }
 
   return (
@@ -31,6 +70,7 @@ export default function SettingsPage() {
         </p>
       </div>
 
+      {message && <p role="status" className="text-sm text-amber-300">{message}</p>}
       <div className="rounded-xl border border-zinc-800 bg-[#111216] p-5 space-y-4">
         <div className="flex flex-wrap items-center justify-between gap-3">
           <div className="flex items-center gap-3">
@@ -42,15 +82,18 @@ export default function SettingsPage() {
               </div>
             </div>
           </div>
-          <div className="flex items-center gap-3">
+          <div className="flex flex-wrap items-center gap-3">
             <StatusBadge value={identity?.drive_connected ? "online" : "offline"} />
             <button
               onClick={handleConnectDrive}
-              disabled={isDemo}
+              disabled={!identity || isDemo || busy}
               className="rounded-lg bg-amber-500 px-3.5 py-2 text-xs font-semibold text-zinc-950 hover:bg-amber-400 disabled:opacity-50"
             >
               {identity?.drive_connected ? "Reconnect Drive" : "Connect Google Drive"}
             </button>
+            {!isDemo && (identity?.drive_connected || identity?.csrf_token) && (
+              <button disabled={busy} onClick={signOut} className="rounded-lg border border-zinc-700 px-3 py-2 text-xs">Sign Out</button>
+            )}
           </div>
         </div>
       </div>
@@ -93,18 +136,12 @@ export default function SettingsPage() {
           Connect Antigravity directly to your live declarative timeline editor using <code>MCP_ACCESS_TOKEN</code>:
         </p>
         <pre className="rounded-lg border border-zinc-800 bg-black/60 p-3 font-mono text-[11px] text-zinc-200 overflow-x-auto">
-{`{
-  "mcpServers": {
-    "kinetiq-studio": {
-      "url": "${API_BASE}/mcp",
-      "headers": { "Authorization": "Bearer <YOUR_MCP_ACCESS_TOKEN>" }
-    }
-  }
-}`}
+{mcpConfig}
         </pre>
-        <div className="flex items-center gap-1.5 text-zinc-400">
+        <button className="rounded-lg border border-zinc-700 px-3 py-1.5" onClick={copyConfig}>Copy MCP Config</button>
+        <div className="flex flex-wrap items-center gap-1.5 text-zinc-400">
           <Key className="h-3.5 w-3.5" />
-          Tools exposed: <code>get_timeline_summary</code>, <code>get_scene</code>, <code>apply_editor_commands</code>
+          Tools exposed: <code>get_timeline_summary</code>, <code>get_scene</code>, <code>apply_editor_commands</code>, <code>review_draft</code>
         </div>
       </div>
     </div>
