@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 import asyncio
+import re
+from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
 from urllib.parse import quote
 
+import anyio
 import httpx
 from sqlalchemy.orm import Session
 
@@ -11,9 +14,7 @@ from app.core.config import get_settings
 from app.core.errors import NotFoundError, ValidationFailedError
 from app.identity.service import get_valid_google_access_token
 from app.storage.local import local_metadata, start_upload, validate_upload_key, vault_path
-
-FILES = "https://www.googleapis.com/drive/v3/files"
-UPLOAD = "https://www.googleapis.com/upload/drive/v3/files"
+from app.storage.snapshot_io import FILES, UPLOAD, DriveSnapshotIO, LocalSnapshotIO
 
 
 @dataclass
@@ -35,6 +36,11 @@ class VerifiedFile:
 
 
 class StorageProvider:
+    @staticmethod
+    def _validate_range(start: int, end: int | None, chunk_size: int) -> None:
+        if start < 0 or (end is not None and end < start) or chunk_size <= 0:
+            raise ValidationFailedError("Invalid byte range or chunk size")
+
     async def verify_uploaded_file(
         self,
         *,
@@ -53,7 +59,7 @@ class StorageProvider:
         return VerifiedFile(storage_key, drive_file_id, expected_size, actual_sha256)
 
 
-class LocalVaultProvider(StorageProvider):
+class LocalVaultProvider(LocalSnapshotIO, StorageProvider):
     name = "local"
 
     async def ensure_project_space(self, project_id, slug, user_id):
@@ -69,6 +75,25 @@ class LocalVaultProvider(StorageProvider):
     async def metadata(self, user_id, storage_key, drive_file_id, checksum=False):
         return await asyncio.to_thread(local_metadata, storage_key, checksum)
 
+    async def stream_range(
+        self, user_id, storage_key, drive_file_id, start=0, end=None, chunk_size=2 * 1024 * 1024
+    ) -> AsyncIterator[bytes]:
+        self._validate_range(start, end, chunk_size)
+        try:
+            handle = await anyio.open_file(vault_path(storage_key), "rb")
+        except (FileNotFoundError, IsADirectoryError, NotADirectoryError):
+            raise NotFoundError("Vault file missing") from None
+        async with handle:
+            await handle.seek(start)
+            remaining = end - start + 1 if end is not None else None
+            while remaining is None or remaining > 0:
+                chunk = await handle.read(chunk_size if remaining is None else min(chunk_size, remaining))
+                if not chunk:
+                    break
+                if remaining is not None:
+                    remaining -= len(chunk)
+                yield chunk
+
     async def read_range(self, *, user_id, storage_key, drive_file_id, start=0, end=None):
         meta = await self.metadata(user_id, storage_key, drive_file_id)
 
@@ -80,7 +105,7 @@ class LocalVaultProvider(StorageProvider):
         return await asyncio.to_thread(read), int(meta["size"]), meta["mimeType"] or "application/octet-stream"
 
 
-class GoogleDriveProvider(StorageProvider):
+class GoogleDriveProvider(DriveSnapshotIO, StorageProvider):
     name = "drive"
 
     def __init__(self, db: Session):
@@ -161,6 +186,33 @@ class GoogleDriveProvider(StorageProvider):
         if meta.get("trashed"):
             raise NotFoundError("Drive file trashed")
         return meta
+
+    async def stream_range(
+        self, user_id, storage_key, drive_file_id, start=0, end=None, chunk_size=2 * 1024 * 1024
+    ) -> AsyncIterator[bytes]:
+        self._validate_range(start, end, chunk_size)
+        if not drive_file_id:
+            raise NotFoundError("Drive file ID missing")
+        headers = await self._headers(user_id)
+        headers.update({"Range": f"bytes={start}-{end if end is not None else ''}", "Accept-Encoding": "identity"})
+        url = f"{FILES}/{quote(drive_file_id, safe='')}"
+        async with httpx.AsyncClient(timeout=120) as client:
+            async with client.stream("GET", url, params={"alt": "media"}, headers=headers) as response:
+                if response.status_code == 404:
+                    raise NotFoundError("Drive file missing")
+                response.raise_for_status()
+                if response.status_code == 206:
+                    match = re.fullmatch(r"bytes (\d+)-(\d+)/(\d+)", response.headers.get("Content-Range", ""))
+                    if not match:
+                        raise ValidationFailedError("Drive returned an invalid Content-Range")
+                    first, last, total = map(int, match.groups())
+                    expected_end = total - 1 if end is None else min(end, total - 1)
+                    if first != start or last != expected_end or last < first:
+                        raise ValidationFailedError("Drive returned a different byte range")
+                elif response.status_code != 200 or start != 0 or end is not None:
+                    raise ValidationFailedError("Drive did not honor the requested byte range")
+                async for chunk in response.aiter_bytes(chunk_size):
+                    yield chunk
 
     async def read_range(self, *, user_id, storage_key, drive_file_id, start=0, end=None):
         if not drive_file_id:
