@@ -13,6 +13,7 @@ const Master: React.FC<RenderProps> = ({document, mediaFiles}) => {
   const mediaUrls = Object.fromEntries(
     Object.entries(mediaFiles).map(([id, filename]) => [id, staticFile(filename)]),
   );
+  // Pass the frozen timeline through, including each split clip's source_start_ms.
   return <EduComposition document={document} mediaUrls={mediaUrls} />;
 };
 
