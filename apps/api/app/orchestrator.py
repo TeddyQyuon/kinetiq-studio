@@ -4,16 +4,35 @@ import asyncio
 import logging
 from datetime import datetime, timedelta, timezone
 
+from pydantic import ValidationError
+from sqlalchemy import select, update
 from sqlalchemy.orm import Session
 
 from app.core.config import get_settings
 from app.core.db import SessionLocal, init_db
+from app.core.errors import NotFoundError, ValidationFailedError
 from app.core.logging import configure_logging
 from app.events.service import emit_event
-from app.models import Job, Project, Scene, Worker
+from app.exports.router import queue_export
+from app.models import Export, Job, Project, Scene, Worker
 from app.storage.reconcile import reconcile_vault
+from app.storage.snapshots import snapshot_pending_revisions
 
 logger = logging.getLogger("kinetiq.orchestrator")
+
+
+def _queue_draft_if_missing(db: Session, project: Project) -> None:
+    existing = select(Export.id).where(Export.project_id == project.id, Export.revision == project.current_revision)
+    if db.scalar(existing.limit(1)) is not None:
+        return
+    try:
+        # A later scene can fail validation after earlier scenes queued dependencies.
+        with db.begin_nested():
+            queue_export(db, project, "1080p")
+    except (ValidationFailedError, ValidationError, NotFoundError):
+        logger.warning(
+            "Skipping draft export for project %s revision %s: incomplete inputs", project.id, project.current_revision
+        )
 
 
 def run_orchestrator_tick(db: Session) -> dict[str, int]:
@@ -58,13 +77,19 @@ def run_orchestrator_tick(db: Session) -> dict[str, int]:
         marked_offline += 1
 
     # 3. Advance project status when all scenes reach ready
-    generating_projects = db.query(Project).filter(Project.status == "generating").all()
+    ready = (Project.status == "generating", Project.scenes.any(), ~Project.scenes.any(Scene.status != "ready"))
     completed_projects = 0
-    for proj in generating_projects:
-        scenes = db.query(Scene).filter(Scene.project_id == proj.id).all()
-        if scenes and all(s.status == "ready" for s in scenes):
-            proj.status = "ready"
+    for proj in db.scalars(select(Project).where(*ready).order_by(Project.id)).all():
+        # Only the tick winning this transition may enqueue a draft for this revision.
+        changed = db.execute(
+            update(Project)
+            .where(Project.id == proj.id, Project.current_revision == proj.current_revision, *ready)
+            .values(status="ready")
+        )
+        if changed.rowcount == 1:
             emit_event(db, "project.ready", {"project_id": proj.id}, project_id=proj.id)
+            if settings.auto_export_draft_on_ready:
+                _queue_draft_if_missing(db, proj)
             completed_projects += 1
 
     if reclaimed or marked_offline or completed_projects:
@@ -79,11 +104,12 @@ def run_orchestrator_tick(db: Session) -> dict[str, int]:
 
 async def _reconciliation_loop() -> None:
     while True:
-        try:
-            with SessionLocal() as db:
-                await reconcile_vault(db)
-        except Exception:
-            logger.exception("Vault reconciliation failed")
+        for operation in (snapshot_pending_revisions, reconcile_vault):
+            try:
+                with SessionLocal() as db:
+                    await operation(db)
+            except Exception:
+                logger.exception("Vault operation %s failed", operation.__name__)
         await asyncio.sleep(get_settings().vault_reconcile_interval_seconds)
 
 
