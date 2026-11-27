@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends, Response
+from fastapi import APIRouter, Depends, Request, Response
 from sqlalchemy.orm import Session
 
 from app.core.config import get_settings
@@ -10,10 +10,9 @@ from app.core.errors import NotFoundError, ValidationFailedError
 from app.events.service import emit_event
 from app.exports.schemas import ExportCreateRequest, ExportRead
 from app.exports.service import enqueue_export_dependencies
-from app.identity.service import ensure_default_owner
 from app.jobs.service import enqueue_job
 from app.models import Asset, Export, Project
-from app.storage.drive import get_storage_provider
+from app.storage.downloads import asset_response
 from app.timeline.service import get_latest_timeline
 
 router = APIRouter(prefix="/v1", tags=["exports"])
@@ -51,6 +50,54 @@ def list_exports(project_id: str, db: Session = Depends(get_db)) -> list[ExportR
     return [_to_export_read(db, e) for e in rows]
 
 
+def queue_export(db: Session, proj: Project, resolution: str) -> Export:
+    """Queue an export and its DAG within the caller's transaction."""
+    doc = get_latest_timeline(db, proj.id)
+
+    if doc.project_id != proj.id:
+        raise ValidationFailedError("Project and timeline identifiers differ")
+
+    if doc.revision != proj.current_revision:
+        raise ValidationFailedError("Project and timeline revisions differ")
+
+    first_narration = doc.tracks.visual[0].narration if doc.tracks.visual else proj.topic
+    publish_kit = {
+        "hook": first_narration,
+        "seo_title": f"{proj.title} ({resolution.upper()})",
+        "description": f"{proj.topic} — clear visual breakdown with animated charts & English narration.",
+        "hashtags": ["#education", "#explainer", "#knowledge", "#learnontiktok"],
+        "ai_disclosure_note": "Enable TikTok 'AI-generated content' & Facebook AI info label before posting to protect monetization.",
+    }
+
+    exp = Export(
+        project_id=proj.id,
+        revision=doc.revision,
+        resolution=resolution,
+        status="queued",
+        publish_kit=publish_kit,
+    )
+    db.add(exp)
+    db.flush()
+
+    dep_ids = enqueue_export_dependencies(db, doc, resolution)
+    enqueue_job(
+        db,
+        project_id=proj.id,
+        scene_id=None,
+        job_type="render",
+        capability="render",
+        payload={"export_id": exp.id, "revision": doc.revision, "resolution": resolution},
+        depends_on=dep_ids,
+    )
+    emit_event(
+        db,
+        "export.queued",
+        {"export_id": exp.id, "resolution": resolution},
+        project_id=proj.id,
+    )
+    return exp
+
+
 @router.post("/projects/{project_id}/exports", response_model=ExportRead)
 def create_export(
     project_id: str,
@@ -60,46 +107,7 @@ def create_export(
     proj = db.query(Project).filter(Project.id == project_id).first()
     if not proj:
         raise NotFoundError(f"Project {project_id} not found")
-    doc = get_latest_timeline(db, project_id)
-
-    if doc.project_id != proj.id:
-        raise ValidationFailedError("Project and timeline identifiers differ")
-
-    first_narration = doc.tracks.visual[0].narration if doc.tracks.visual else proj.topic
-    publish_kit = {
-        "hook": first_narration,
-        "seo_title": f"{proj.title} ({body.resolution.upper()})",
-        "description": f"{proj.topic} — clear visual breakdown with animated charts & English narration.",
-        "hashtags": ["#education", "#explainer", "#knowledge", "#learnontiktok"],
-        "ai_disclosure_note": "Enable TikTok 'AI-generated content' & Facebook AI info label before posting to protect monetization.",
-    }
-
-    exp = Export(
-        project_id=proj.id,
-        revision=doc.revision,
-        resolution=body.resolution,
-        status="queued",
-        publish_kit=publish_kit,
-    )
-    db.add(exp)
-    db.flush()
-
-    dep_ids = enqueue_export_dependencies(db, doc, body.resolution)
-    enqueue_job(
-        db,
-        project_id=proj.id,
-        scene_id=None,
-        job_type="render",
-        capability="render",
-        payload={"export_id": exp.id, "revision": doc.revision, "resolution": body.resolution},
-        depends_on=dep_ids,
-    )
-    emit_event(
-        db,
-        "export.queued",
-        {"export_id": exp.id, "resolution": body.resolution},
-        project_id=proj.id,
-    )
+    exp = queue_export(db, proj, body.resolution)
     db.commit()
     db.refresh(exp)
     return _to_export_read(db, exp)
@@ -114,24 +122,15 @@ def get_export(export_id: str, db: Session = Depends(get_db)) -> ExportRead:
 
 
 @router.get("/exports/{export_id}/download")
-async def download_export(export_id: str, db: Session = Depends(get_db)) -> Response:
+async def download_export(
+    export_id: str, request: Request, inline: bool = False, db: Session = Depends(get_db)
+) -> Response:
     exp = db.query(Export).filter(Export.id == export_id).first()
     if not exp or not exp.master_asset_id:
         raise NotFoundError("Export file is not ready for download yet")
     ast = db.query(Asset).filter(Asset.id == exp.master_asset_id).first()
-    if not ast:
+    if not ast or ast.project_id != exp.project_id:
         raise NotFoundError("Export asset missing")
 
-    user = ensure_default_owner(db)
-    provider = get_storage_provider(db)
-    data, _total, ctype = await provider.read_range(
-        user_id=user.id,
-        storage_key=ast.storage_key,
-        drive_file_id=ast.drive_file_id,
-    )
     filename = f"kinetiq_{exp.project_id}_{exp.resolution}.mp4"
-    return Response(
-        content=data,
-        media_type=ctype,
-        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
-    )
+    return await asset_response(db, request, ast, filename=filename, inline=inline)
