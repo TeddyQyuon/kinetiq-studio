@@ -4,22 +4,20 @@
     "inputs": {
       "video": "__INPUT_VIDEO__",
       "force_rate": 0,
-      "force_size": "Disabled",
-      "custom_width": 0,
-      "custom_height": 0,
+      "custom_width": "__MASTER_WIDTH__",
+      "custom_height": "__MASTER_HEIGHT__",
       "frame_load_cap": 0,
       "skip_first_frames": 0,
       "select_every_nth": 1
     }
   },
   "2": {
-    "class_type": "FlashVSR",
+    "class_type": "AILab_FlashVSR",
     "inputs": {
-      "images": ["1", 0],
-      "model": "FlashVSR-v1.1",
-      "mode": "tiny-long",
+      "frames": ["1", 0],
+      "preset": "Long Video (Low VRAM)",
       "scale": 2,
-      "tiled": true,
+      "unload_model": true,
       "seed": "__SEED__"
     }
   },

@@ -34,29 +34,6 @@ def _parse_range_end(range_header: str | None) -> int:
         return -1
 
 
-def _query_uploaded_offset(
-    client: httpx.Client,
-    session_uri: str,
-    headers: dict[str, str],
-    total_bytes: int,
-) -> int:
-    res = client.put(
-        session_uri,
-        headers={
-            **headers,
-            "Content-Length": "0",
-            "Content-Range": f"bytes */{total_bytes}",
-        },
-    )
-    if res.status_code == 308:
-        end_byte = _parse_range_end(res.headers.get("Range"))
-        return end_byte + 1 if end_byte >= 0 else 0
-    if res.status_code in (200, 201):
-        return total_bytes
-    res.raise_for_status()
-    return 0
-
-
 def upload_file_resumable(
     file_path: Path,
     *,
@@ -75,50 +52,57 @@ def upload_file_resumable(
     aligned_chunk = max(CHUNK_ALIGNMENT, (chunk_size_bytes // CHUNK_ALIGNMENT) * CHUNK_ALIGNMENT)
     headers = dict(upload_headers)
     offset = 0
-    attempt = 0
-
-    with httpx.Client(timeout=120) as client, open(file_path, "rb") as f:
-        while offset < total_bytes:
-            end = min(offset + aligned_chunk, total_bytes)
-            f.seek(offset)
-            chunk = f.read(end - offset)
-
-            put_headers = {
-                **headers,
-                "Content-Type": content_type,
-                "Content-Range": f"bytes {offset}-{end - 1}/{total_bytes}",
-            }
+    failures = 0
+    probe = False
+    with httpx.Client(timeout=120) as client, file_path.open("rb") as f:
+        while True:
+            if probe:
+                content_range = f"bytes */{total_bytes}"
+                chunk = b""
+            else:
+                f.seek(offset)
+                chunk = f.read(aligned_chunk)
+                content_range = f"bytes {offset}-{offset + len(chunk) - 1}/{total_bytes}"
             try:
-                resp = client.put(session_uri, headers=put_headers, content=chunk)
-                if resp.status_code == 401 and refresh_auth_fn is not None:
-                    new_auth = refresh_auth_fn()
-                    if new_auth:
-                        headers["Authorization"] = new_auth
-                        continue
-
-                if resp.status_code == 308:
-                    attempt = 0
-                    range_end = _parse_range_end(resp.headers.get("Range"))
-                    offset = (range_end + 1) if range_end >= 0 else end
-                    continue
-
+                resp = client.put(
+                    session_uri,
+                    headers={**headers, "Content-Type": content_type, "Content-Range": content_range},
+                    content=chunk,
+                )
+            except httpx.TransportError:
+                if failures >= max_retries:
+                    raise
+                probe = True
+            else:
                 if resp.status_code in (200, 201):
                     meta = resp.json() if resp.content else {}
-                    return {
-                        "drive_file_id": meta.get("id"),
-                        "size_bytes": total_bytes,
-                        "sha256": sha256_file(file_path),
-                    }
+                    return {"drive_file_id": meta.get("id"), "size_bytes": total_bytes, "sha256": sha256_file(file_path)}
+                if resp.status_code == 308:
+                    acknowledged = _parse_range_end(resp.headers.get("Range")) + 1
+                    if not 0 <= acknowledged <= total_bytes:
+                        raise ValueError("Invalid resumable upload offset")
+                    advanced = acknowledged > offset
+                    offset = acknowledged
+                    was_probe = probe
+                    probe = offset == total_bytes
+                    if advanced:
+                        failures = 0
+                        continue
+                    if was_probe and not probe and failures < max_retries:
+                        continue
+                elif resp.status_code == 401 and refresh_auth_fn and failures < max_retries:
+                    auth = refresh_auth_fn()
+                    if not auth:
+                        resp.raise_for_status()
+                    headers["Authorization"] = auth
+                    probe = True
+                elif resp.status_code in {408, 409, 429} or resp.is_server_error:
+                    probe = True
+                else:
+                    resp.raise_for_status()
+                    raise RuntimeError(f"Unexpected upload response {resp.status_code}")
 
-                resp.raise_for_status()
-            except (httpx.HTTPError, OSError):
-                attempt += 1
-                if attempt > max_retries:
-                    raise
-                time.sleep(min(30, 2 ** attempt))
-                try:
-                    offset = _query_uploaded_offset(client, session_uri, headers, total_bytes)
-                except Exception:
-                    pass
-
-    return {"drive_file_id": None, "size_bytes": total_bytes, "sha256": sha256_file(file_path)}
+            failures += 1
+            if failures > max_retries:
+                raise RuntimeError("Resumable upload made no progress after retries")
+            time.sleep(min(30, 2 ** failures))

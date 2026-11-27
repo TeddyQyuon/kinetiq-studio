@@ -6,9 +6,10 @@ from sqlalchemy.orm import Session
 from app.core.config import get_settings
 from app.core.crypto import sign_media_token
 from app.core.db import get_db
-from app.core.errors import NotFoundError
+from app.core.errors import NotFoundError, ValidationFailedError
 from app.events.service import emit_event
 from app.exports.schemas import ExportCreateRequest, ExportRead
+from app.exports.service import enqueue_export_dependencies
 from app.identity.service import ensure_default_owner
 from app.jobs.service import enqueue_job
 from app.models import Asset, Export, Project
@@ -61,20 +62,8 @@ def create_export(
         raise NotFoundError(f"Project {project_id} not found")
     doc = get_latest_timeline(db, project_id)
 
-    dep_ids: list[str] = []
-    if body.resolution == "4k":
-        for s in doc.tracks.visual:
-            if s.kind == "ai_video" and s.assets and s.assets.master and not s.assets.upscaled_4k:
-                up = enqueue_job(
-                    db,
-                    project_id=proj.id,
-                    scene_id=s.id,
-                    job_type="upscale_flashvsr",
-                    capability="upscale_flashvsr",
-                    payload={"master_asset_id": s.assets.master},
-                    est_cu=0.12,
-                )
-                dep_ids.append(up.id)
+    if doc.project_id != proj.id:
+        raise ValidationFailedError("Project and timeline identifiers differ")
 
     first_narration = doc.tracks.visual[0].narration if doc.tracks.visual else proj.topic
     publish_kit = {
@@ -87,7 +76,7 @@ def create_export(
 
     exp = Export(
         project_id=proj.id,
-        revision=proj.current_revision,
+        revision=doc.revision,
         resolution=body.resolution,
         status="queued",
         publish_kit=publish_kit,
@@ -95,13 +84,14 @@ def create_export(
     db.add(exp)
     db.flush()
 
+    dep_ids = enqueue_export_dependencies(db, doc, body.resolution)
     enqueue_job(
         db,
         project_id=proj.id,
         scene_id=None,
         job_type="render",
         capability="render",
-        payload={"export_id": exp.id, "revision": proj.current_revision, "resolution": body.resolution},
+        payload={"export_id": exp.id, "revision": doc.revision, "resolution": body.resolution},
         depends_on=dep_ids,
     )
     emit_event(
