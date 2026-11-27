@@ -12,6 +12,19 @@ services:
     ports: !reset []
     environment:
       APP_ENV: phase1_vps
+      RUN_EMBEDDED_ORCHESTRATOR: "false"
+      OWNER_GOOGLE_EMAIL: ${OWNER_GOOGLE_EMAIL:-}
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:8000/ready || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 15s
+
+  orchestrator:
+    environment:
+      APP_ENV: phase1_vps
+      OWNER_GOOGLE_EMAIL: ${OWNER_GOOGLE_EMAIL:-}
 
   web:
     ports: !reset []
@@ -20,8 +33,10 @@ services:
     image: caddy:2-alpine
     restart: unless-stopped
     depends_on:
-      - web
-      - api
+      web:
+        condition: service_started
+      api:
+        condition: service_healthy
     ports:
       - "80:80"
       - "443:443"
