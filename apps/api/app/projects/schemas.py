@@ -14,7 +14,7 @@ class ProjectCreateRequest(BaseModel):
     target_res: Literal["720p", "1080p", "4k"] = "1080p"
     duration_preset: Literal["reel_60s", "lesson_5m", "lesson_10m"] = "reel_60s"
     qa_policy: Literal["hotl_smart", "hitl_strict_gate", "full_auto"] = "hotl_smart"
-    brain_mode: Literal["gemini_auto", "chatgpt_bridge", "openai_api"] = "gemini_auto"
+    brain_mode: Literal["gemini_auto", "chatgpt_bridge", "openai_api", "colab_ai"] = "gemini_auto"
     script_override: str | None = None
 
 

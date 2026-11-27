@@ -39,12 +39,14 @@ from app.projects.service import (
     build_project_summary,
     create_project_with_initial_timeline,
     dispatch_generation_pipeline,
+    project_qa_analytics,
 )
+from app.qa.consumer import clip_qa_lifespan
 from app.qa.schemas import QAReviewRead
 from app.timeline.schemas import TimelineCommand, TimelineDocument
 from app.timeline.service import apply_timeline_commands
 
-router = APIRouter(prefix="/v1/projects", tags=["projects"])
+router = APIRouter(prefix="/v1/projects", tags=["projects"], lifespan=clip_qa_lifespan)
 
 
 def _get_project(db: Session, project_id: str) -> Project:
@@ -151,6 +153,12 @@ def list_project_jobs(project_id: str, db: Session = Depends(get_db)) -> list[Jo
         )
         for j in rows
     ]
+
+
+@router.get("/{project_id}/qa-analytics")
+def qa_analytics(project_id: str, db: Session = Depends(get_db)) -> dict:
+    """Pass fraction per reviewed render and number of QA-requested rerenders."""
+    return project_qa_analytics(db, _get_project(db, project_id).id)
 
 
 @router.get("/{project_id}/qa-reviews", response_model=list[QAReviewRead])
