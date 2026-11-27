@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import uuid
 
-from fastapi import APIRouter, Depends, Header
+from fastapi import APIRouter, Depends, Header, Request
 from sqlalchemy.orm import Session
 
 from app.core.db import get_db
@@ -26,7 +26,11 @@ from app.director.service import (
 from app.jobs.schemas import JobRead
 from app.jobs.service import enqueue_job
 from app.models import Job, Project, QAReview
+from app.projects.media import read_music
 from app.projects.schemas import (
+    MusicPresetRequest,
+    MusicUploadResponse,
+    ProjectDuplicateRequest,
     ProjectCreateRequest,
     ProjectDetailRead,
     ProjectSummaryRead,
@@ -35,10 +39,15 @@ from app.projects.schemas import (
 )
 from app.projects.service import (
     approve_scene_and_dispatch,
+    attach_music,
+    check_project_revision,
+    detach_music,
+    duplicate_project,
     build_project_detail,
     build_project_summary,
     create_project_with_initial_timeline,
     dispatch_generation_pipeline,
+    enqueue_scene_revoice,
     project_qa_analytics,
 )
 from app.qa.consumer import clip_qa_lifespan
@@ -207,6 +216,59 @@ def _parse_if_match(if_match: str | None) -> int | None:
     if not cleaned.isdigit():
         raise ValidationFailedError("If-Match header must be a numeric timeline revision")
     return int(cleaned)
+
+
+@router.post("/{project_id}/scenes/{scene_id}/revoice")
+def revoice_scene(
+    project_id: str,
+    scene_id: str,
+    if_match: str | None = Header(default=None, alias="If-Match"),
+    db: Session = Depends(get_db),
+) -> dict:
+    project = _get_project(db, project_id)
+    check_project_revision(project, _parse_if_match(if_match))
+    return enqueue_scene_revoice(db, project, scene_id)
+
+
+@router.post("/{project_id}/music", response_model=MusicUploadResponse, openapi_extra={
+    "requestBody": {"required": True, "content": {
+        "application/json": {"schema": MusicPresetRequest.model_json_schema()},
+        "multipart/form-data": {"schema": {"type": "object", "required": ["file"], "properties": {
+            "file": {"type": "string", "format": "binary"}, "volume": {"type": "number", "default": 0.25},
+            "duck_db": {"type": "number", "default": -26}, "mood": {"type": "string", "default": "custom"},
+        }}},
+    }},
+})
+async def set_project_music(
+    project_id: str,
+    request: Request,
+    if_match: str | None = Header(default=None, alias="If-Match"),
+    db: Session = Depends(get_db),
+) -> MusicUploadResponse:
+    project = _get_project(db, project_id)
+    revision = check_project_revision(project, _parse_if_match(if_match))
+    return await attach_music(db, project, await read_music(request), revision)
+
+
+@router.delete("/{project_id}/music", response_model=TimelineDocument)
+def remove_project_music(
+    project_id: str,
+    if_match: str | None = Header(default=None, alias="If-Match"),
+    db: Session = Depends(get_db),
+) -> TimelineDocument:
+    project = _get_project(db, project_id)
+    revision = check_project_revision(project, _parse_if_match(if_match))
+    return detach_music(db, project, revision)
+
+
+@router.post("/{project_id}/duplicate", response_model=ProjectDetailRead)
+def duplicate_project_route(
+    project_id: str,
+    body: ProjectDuplicateRequest | None = None,
+    db: Session = Depends(get_db),
+) -> ProjectDetailRead:
+    copy = duplicate_project(db, _get_project(db, project_id), body.title if body else None)
+    return build_project_detail(db, copy)
 
 
 @router.post("/{project_id}/scenes/{scene_id}/regenerate")

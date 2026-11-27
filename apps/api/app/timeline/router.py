@@ -7,7 +7,9 @@ from app.core.db import get_db
 from app.core.errors import NotFoundError
 from app.models import Project, TimelineRevision
 from app.timeline.schemas import CommandBatchRequest, TimelineDocument, TimelinePutRequest
-from app.timeline.service import apply_timeline_commands, get_latest_timeline, save_timeline_document
+from app.timeline.service import (
+    apply_timeline_commands, get_latest_timeline, invalidate_changed_speech, save_timeline_document,
+)
 
 router = APIRouter(prefix="/v1/projects/{project_id}", tags=["timeline"])
 
@@ -28,6 +30,7 @@ def put_timeline(
     if not project:
         raise NotFoundError(f"Project {project_id} not found")
     expected = int(if_match) if (if_match and if_match.isdigit()) else body.expected_revision
+    invalidate_changed_speech(get_latest_timeline(db, project_id), body.document)
     return save_timeline_document(db, project, expected, body.document, author=body.author)
 
 
@@ -39,7 +42,7 @@ def post_commands(
     db: Session = Depends(get_db),
 ) -> TimelineDocument:
     expected = int(if_match) if (if_match and if_match.isdigit()) else body.expected_revision
-    return apply_timeline_commands(db, project_id, expected, body.commands, author=body.author)
+    return apply_timeline_commands(db, project_id, expected, body.commands, author=body.author, dispatch_jobs=True)
 
 
 @router.get("/revisions")

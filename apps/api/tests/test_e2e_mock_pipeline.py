@@ -288,7 +288,8 @@ def test_full_mock_pipeline_e2e_lifecycle(e2e_studio) -> None:
     # 3. Generate pipeline & register GPU worker
     gen_res = client.post(f"/v1/projects/{pid}/generate")
     assert gen_res.status_code == 200, gen_res.text
-    assert gen_res.json()["queued_jobs"] == 1
+    assert gen_res.json()["queued_jobs"] == 5  # keyframe plus TTS and alignment for both scenes
+    first_scene_id = imported_doc["tracks"]["visual"][0]["id"]
 
     gpu_wid, gpu_headers = _register_worker(
         client,
@@ -308,7 +309,7 @@ def test_full_mock_pipeline_e2e_lifecycle(e2e_studio) -> None:
     assert kf_claim.status_code == 200, kf_claim.text
     kf_job = kf_claim.json()
     assert kf_job["job_type"] == "keyframe_qwen"
-    assert kf_job["scene_id"] == "scn_001"
+    assert kf_job["scene_id"] == first_scene_id
     assert kf_job["comfy_graph"] is not None
 
     prog_res = client.post(f"/v1/workers/jobs/{kf_job['id']}/progress", headers=gpu_headers, json={"percent": 50})
@@ -349,7 +350,7 @@ def test_full_mock_pipeline_e2e_lifecycle(e2e_studio) -> None:
     assert blocked_claim.status_code == 204
 
     # 5. HOTL human approval -> unlocks i2v_ltx25 -> 8 MiB chunked upload + resume probe
-    approve_res = client.post(f"/v1/projects/{pid}/scenes/scn_001/approve")
+    approve_res = client.post(f"/v1/projects/{pid}/scenes/{first_scene_id}/approve")
     assert approve_res.status_code == 200, approve_res.text
     assert approve_res.json()["queued_job_id"] is not None
 
@@ -407,8 +408,12 @@ def test_full_mock_pipeline_e2e_lifecycle(e2e_studio) -> None:
     )
     assert clip_comp.status_code == 200, clip_comp.text
 
+    # The rendered clip has its own QA gate. Approve the master before exporting.
+    confirm = client.post(f"/v1/projects/{pid}/scenes/{first_scene_id}/approve")
+    assert confirm.is_success and confirm.json()["queued_job_id"] is None
     proj_ready = client.get(f"/v1/projects/{pid}").json()
-    assert proj_ready["ready_scenes"] == 2
+    assert proj_ready["ready_scenes"] == 1
+    assert proj_ready["timeline"]["tracks"]["visual"][1]["status"] == "generating_audio"
     assert proj_ready["timeline"]["tracks"]["visual"][0]["status"] == "ready"
     master_asset_id = proj_ready["timeline"]["tracks"]["visual"][0]["assets"]["master"]
     assert master_asset_id in proj_ready["media_urls"]
@@ -426,7 +431,7 @@ def test_full_mock_pipeline_e2e_lifecycle(e2e_studio) -> None:
         f"/v1/projects/{pid}/copilot",
         json={
             "message": "Tighten pauses and add a comparison diagram",
-            "selected_scene_id": "scn_001",
+            "selected_scene_id": first_scene_id,
         },
     )
     assert prop_res.status_code == 200, prop_res.text
@@ -759,7 +764,8 @@ def test_hotl_smart_auto_heal_retries_then_escalates_to_needs_review(e2e_studio,
     )
     assert no_more.status_code == 204
 
-    approved = client.post(f"/v1/projects/{pid}/scenes/scn_001/approve")
+    first_scene_id = detail["timeline"]["tracks"]["visual"][0]["id"]
+    approved = client.post(f"/v1/projects/{pid}/scenes/{first_scene_id}/approve")
     assert approved.status_code == 200
     assert approved.json()["queued_job_id"] is not None
 

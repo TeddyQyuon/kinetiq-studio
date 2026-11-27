@@ -129,8 +129,8 @@ def test_local_mode_and_per_worker_sliding_limits(studio, monkeypatch):
     assert c.get("/v1/me").status_code == 200
     credentials = [c.post("/v1/workers/tokens", json={"name": name}).json() for name in ("one", "two")]
     studio.cfg.app_env = "phase1_vps"
-    studio.cfg.worker_rate_limit = 2
-    studio.cfg.worker_rate_window_seconds = 10
+    monkeypatch.setattr(studio.cfg, "worker_rate_limit", 2)
+    monkeypatch.setattr(studio.cfg, "worker_rate_window_seconds", 10)
     now = 100
     monkeypatch.setattr(rate_limit, "time", SimpleNamespace(monotonic=lambda: now))
 
@@ -318,12 +318,12 @@ def test_sse_replay_and_live_fanout(studio, request, redis_enabled):
     asyncio.run(read_streams())
 
 
-def test_shared_redis_rate_limit(studio, live_redis):
+def test_shared_redis_rate_limit(studio, live_redis, monkeypatch):
     from fastapi import HTTPException
     from app.core.rate_limit import check_worker_rate
 
     studio.cfg.redis_url = live_redis
-    studio.cfg.worker_rate_limit = 1
+    monkeypatch.setattr(studio.cfg, "worker_rate_limit", 1)
     check_worker_rate("worker:one")
     with pytest.raises(HTTPException) as exc:
         check_worker_rate("worker:one")

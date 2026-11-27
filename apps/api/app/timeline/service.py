@@ -1,10 +1,15 @@
 from __future__ import annotations
 
+import uuid
+
+from sqlalchemy import update
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.core.errors import ConflictError, NotFoundError
 from app.events.service import emit_event
 from app.models import Project, Scene, TimelineRevision
+from app.projects.speech import clear_scene_voice, enqueue_dependency, prepare_scene_speech, visual_status
 from app.timeline.commands import apply_command
 from app.timeline.schemas import TimelineCommand, TimelineDocument
 
@@ -80,33 +85,85 @@ def save_timeline_document(
     author: str = "user",
     command_batch: list[dict] | None = None,
 ) -> TimelineDocument:
-    if project.current_revision != expected_revision:
-        raise ConflictError(
+    def conflict() -> ConflictError:
+        return ConflictError(
             f"Revision conflict: expected {expected_revision}, server is at {project.current_revision}",
             details={"server_revision": project.current_revision},
         )
-    new_rev = project.current_revision + 1
-    new_doc.revision = new_rev
-    project.current_revision = new_rev
 
+    if project.current_revision != expected_revision:
+        raise conflict()
+    new_doc.revision = expected_revision + 1
     db.add(
         TimelineRevision(
-            project_id=project.id,
-            revision=new_rev,
-            document=new_doc.model_dump(mode="json"),
-            author=author,
-            command_batch=command_batch or [],
+            project_id=project.id, revision=new_doc.revision, document=new_doc.model_dump(mode="json"),
+            author=author, command_batch=command_batch or [],
         )
     )
-    sync_scenes_projection(db, project.id, new_doc)
-    emit_event(
-        db,
-        "timeline.updated",
-        {"revision": new_rev, "author": author, "scene_count": len(new_doc.tracks.visual)},
-        project_id=project.id,
+    # Keep clip completion and the revision in the same flush for the QA gate.
+    # All writers acquire the outbox lock before changing the project revision.
+    with db.no_autoflush:
+        sync_scenes_projection(db, project.id, new_doc)
+        try:
+            emit_event(
+                db, "timeline.updated",
+                {"revision": new_doc.revision, "author": author, "scene_count": len(new_doc.tracks.visual)},
+                project_id=project.id,
+            )
+        except IntegrityError:
+            db.rollback()
+            if project.current_revision != expected_revision:
+                raise conflict() from None
+            raise
+    changed = db.execute(
+        update(Project)
+        .where(Project.id == project.id, Project.current_revision == expected_revision)
+        .values(current_revision=new_doc.revision)
     )
+    if changed.rowcount != 1:
+        db.rollback()
+        raise conflict()
     db.commit()
     return new_doc
+
+
+def dispatch_jobs_for_commands(
+    db: Session, project: Project, doc: TimelineDocument, commands: list[TimelineCommand],
+) -> list[str]:
+    scenes = {s.id: s for s in doc.tracks.visual}
+    jobs = []
+    # Coalesce repeated edits in a batch; only its final scene inputs are visible.
+    requests = dict.fromkeys(
+        (cmd.type, cmd.scene_id) for cmd in commands if cmd.type in {"edit_narration", "regenerate_clip"}
+    )
+    for kind, scene_id in requests:
+        scene = scenes.get(scene_id)
+        if scene is None:
+            continue
+        if kind == "edit_narration":
+            if scene.narration.strip():
+                jobs.extend(j.id for j in prepare_scene_speech(db, doc, scene))
+            else:
+                clear_scene_voice(doc, scene)
+                if scene.status == "generating_audio":
+                    scene.status = visual_status(scene)
+        else:
+            job = enqueue_dependency(
+                db, project.id, scene.id, "keyframe_qwen", {"seed": scene.seed, "aspect": doc.format.aspect},
+                est_cu=0.02, salt=uuid.uuid4().hex[:6],
+            )
+            jobs.append(job.id)
+    return jobs
+
+
+def invalidate_changed_speech(previous: TimelineDocument, current: TimelineDocument) -> None:
+    old_scenes = {s.id: s for s in previous.tracks.visual}
+    for scene in current.tracks.visual:
+        old = old_scenes.get(scene.id)
+        if old and (old.narration != scene.narration or previous.voice != current.voice):
+            clear_scene_voice(current, scene)
+            if scene.status == "generating_audio":
+                scene.status = visual_status(scene)
 
 
 def apply_timeline_commands(
@@ -116,6 +173,7 @@ def apply_timeline_commands(
     commands: list[TimelineCommand],
     *,
     author: str = "user",
+    dispatch_jobs: bool = False,
 ) -> TimelineDocument:
     project = db.query(Project).filter(Project.id == project_id).first()
     if not project:
@@ -130,6 +188,10 @@ def apply_timeline_commands(
     current = doc
     for cmd in commands:
         current, _ = apply_command(current, cmd)
+
+    invalidate_changed_speech(doc, current)
+    if dispatch_jobs:
+        dispatch_jobs_for_commands(db, project, current, commands)
 
     # save_timeline_document increments revision from project.current_revision once for the batch
     return save_timeline_document(
