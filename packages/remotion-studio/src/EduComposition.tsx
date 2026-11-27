@@ -22,6 +22,330 @@ export interface EduCompositionProps {
   mediaUrls?: Record<string, string>;
 }
 
+const TimelineFlowView: React.FC<{
+  props: DiagramProps;
+  palette: string[];
+}> = ({ props, palette }) => {
+  const frame = useCurrentFrame();
+  const { fps, width, height } = useVideoConfig();
+  const accent = palette[1] ?? "#F59E0B";
+  const secondary = palette[2] ?? "#22D3EE";
+  const isHorizontal = width > height;
+
+  const steps =
+    props.steps && props.steps.length > 0
+      ? props.steps
+      : props.labels && props.labels.length > 0
+        ? props.labels
+        : ["Signal Capture", "Core Transform", "Verified Output"];
+  const labels = props.labels ?? [];
+  const values = props.values ?? [];
+  const highlightIdx = props.highlight_index ?? steps.length - 1;
+
+  const lineProgress = spring({
+    frame: Math.max(0, frame - 4),
+    fps,
+    config: { damping: 18, stiffness: 90 },
+  });
+  const travelProgress = interpolate(frame, [6, Math.max(28, steps.length * 14)], [0, 1], {
+    extrapolateLeft: "clamp",
+    extrapolateRight: "clamp",
+  });
+
+  if (isHorizontal) {
+    return (
+      <div style={{ display: "flex", flexDirection: "column", gap: 28 }}>
+        {/* Horizontal Timeline Spine & Milestone Nodes */}
+        <div style={{ position: "relative", paddingTop: 42, paddingBottom: 18 }}>
+          {/* Background Rail */}
+          <div
+            style={{
+              position: "absolute",
+              top: 58,
+              left: "6%",
+              right: "6%",
+              height: 6,
+              borderRadius: 999,
+              backgroundColor: "rgba(255,255,255,0.1)",
+            }}
+          />
+          {/* Animated Flow Beam */}
+          <div
+            style={{
+              position: "absolute",
+              top: 58,
+              left: "6%",
+              width: `${88 * lineProgress}%`,
+              height: 6,
+              borderRadius: 999,
+              background: `linear-gradient(90deg, ${secondary}, ${accent})`,
+              boxShadow: `0 0 18px ${accent}66`,
+            }}
+          />
+          {/* Traveling Pulse Dot */}
+          <div
+            style={{
+              position: "absolute",
+              top: 52,
+              left: `calc(${6 + 88 * travelProgress}% - 9px)`,
+              width: 18,
+              height: 18,
+              borderRadius: 999,
+              backgroundColor: "#F8FAFC",
+              boxShadow: `0 0 16px ${accent}, 0 0 28px ${secondary}`,
+              opacity: lineProgress,
+            }}
+          />
+
+          <div
+            style={{
+              position: "relative",
+              display: "grid",
+              gridTemplateColumns: `repeat(${steps.length}, minmax(0, 1fr))`,
+              gap: 20,
+            }}
+          >
+            {steps.map((step, idx) => {
+              const nodeSpring = spring({
+                frame: Math.max(0, frame - idx * 8),
+                fps,
+                config: { damping: 14 },
+              });
+              const isHighlight = idx === highlightIdx;
+              const nodeColor = isHighlight ? accent : secondary;
+              const timeTag = labels[idx] ?? `T+${idx + 1}`;
+              const metricVal = values[idx];
+
+              return (
+                <div
+                  key={`${idx}-${step}`}
+                  style={{
+                    position: "relative",
+                    display: "flex",
+                    flexDirection: "column",
+                    alignItems: "center",
+                    opacity: nodeSpring,
+                    transform: `translateY(${(1 - nodeSpring) * 22}px)`,
+                  }}
+                >
+                  {/* Phase / Timestamp Pill */}
+                  <div
+                    style={{
+                      position: "absolute",
+                      top: -40,
+                      padding: "4px 12px",
+                      borderRadius: 999,
+                      backgroundColor: `${nodeColor}22`,
+                      border: `1px solid ${nodeColor}66`,
+                      color: nodeColor,
+                      fontSize: 16,
+                      fontWeight: 700,
+                      letterSpacing: "0.04em",
+                    }}
+                  >
+                    {timeTag}
+                  </div>
+
+                  {/* Node Marker */}
+                  <div
+                    style={{
+                      width: 38,
+                      height: 38,
+                      borderRadius: 999,
+                      backgroundColor: isHighlight ? accent : "#0F172A",
+                      border: `3px solid ${nodeColor}`,
+                      color: isHighlight ? "#09090B" : "#F8FAFC",
+                      display: "flex",
+                      alignItems: "center",
+                      justifyContent: "center",
+                      fontSize: 17,
+                      fontWeight: 800,
+                      boxShadow: `0 0 20px ${nodeColor}55`,
+                      marginBottom: 20,
+                    }}
+                  >
+                    {idx + 1}
+                  </div>
+
+                  {/* Milestone Card */}
+                  <div
+                    style={{
+                      width: "100%",
+                      padding: "18px 20px",
+                      borderRadius: 16,
+                      backgroundColor: isHighlight
+                        ? "rgba(245, 158, 11, 0.1)"
+                        : "rgba(255, 255, 255, 0.05)",
+                      border: isHighlight
+                        ? `1px solid ${accent}88`
+                        : "1px solid rgba(255,255,255,0.12)",
+                      display: "flex",
+                      flexDirection: "column",
+                      gap: 8,
+                    }}
+                  >
+                    <div style={{ fontSize: 22, fontWeight: 700, lineHeight: 1.3 }}>{step}</div>
+                    {metricVal !== undefined && (
+                      <div style={{ fontSize: 18, fontWeight: 600, color: nodeColor }}>
+                        {metricVal}
+                        {props.unit ? ` ${props.unit}` : ""}
+                      </div>
+                    )}
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  // Vertical 9:16 Safe-Zone TimelineFlow Layout
+  return (
+    <div style={{ position: "relative", paddingLeft: 44, display: "flex", flexDirection: "column", gap: 18 }}>
+      {/* Vertical Background Rail */}
+      <div
+        style={{
+          position: "absolute",
+          left: 18,
+          top: 20,
+          bottom: 20,
+          width: 5,
+          borderRadius: 999,
+          backgroundColor: "rgba(255,255,255,0.1)",
+        }}
+      />
+      {/* Animated Vertical Flow Rail */}
+      <div
+        style={{
+          position: "absolute",
+          left: 18,
+          top: 20,
+          bottom: 20,
+          width: 5,
+          borderRadius: 999,
+          background: `linear-gradient(180deg, ${secondary}, ${accent})`,
+          boxShadow: `0 0 16px ${accent}66`,
+          transformOrigin: "top center",
+          transform: `scaleY(${lineProgress})`,
+        }}
+      />
+      {/* Traveling Vertical Pulse Dot */}
+      <div
+        style={{
+          position: "absolute",
+          left: 13.5,
+          top: `${6 + 88 * travelProgress}%`,
+          width: 14,
+          height: 14,
+          borderRadius: 999,
+          backgroundColor: "#F8FAFC",
+          boxShadow: `0 0 14px ${accent}, 0 0 24px ${secondary}`,
+          opacity: lineProgress,
+        }}
+      />
+
+      {steps.map((step, idx) => {
+        const nodeSpring = spring({
+          frame: Math.max(0, frame - idx * 8),
+          fps,
+          config: { damping: 14 },
+        });
+        const isHighlight = idx === highlightIdx;
+        const nodeColor = isHighlight ? accent : secondary;
+        const timeTag = labels[idx] ?? `T+${idx + 1}`;
+        const metricVal = values[idx];
+
+        return (
+          <div
+            key={`${idx}-${step}`}
+            style={{
+              position: "relative",
+              opacity: nodeSpring,
+              transform: `translateX(${(1 - nodeSpring) * 26}px)`,
+              display: "flex",
+              alignItems: "center",
+            }}
+          >
+            {/* Node Dot on Vertical Rail */}
+            <div
+              style={{
+                position: "absolute",
+                left: -38,
+                width: 28,
+                height: 28,
+                borderRadius: 999,
+                backgroundColor: isHighlight ? accent : "#0F172A",
+                border: `3px solid ${nodeColor}`,
+                color: isHighlight ? "#09090B" : "#F8FAFC",
+                display: "flex",
+                alignItems: "center",
+                justifyContent: "center",
+                fontSize: 14,
+                fontWeight: 800,
+                boxShadow: `0 0 16px ${nodeColor}55`,
+              }}
+            >
+              {idx + 1}
+            </div>
+
+            {/* Connector Tick */}
+            <div
+              style={{
+                position: "absolute",
+                left: -10,
+                width: 10,
+                height: 2,
+                backgroundColor: `${nodeColor}99`,
+              }}
+            />
+
+            {/* Milestone Card */}
+            <div
+              style={{
+                width: "100%",
+                padding: "16px 20px",
+                borderRadius: 16,
+                backgroundColor: isHighlight
+                  ? "rgba(245, 158, 11, 0.1)"
+                  : "rgba(255, 255, 255, 0.05)",
+                border: isHighlight
+                  ? `1px solid ${accent}88`
+                  : "1px solid rgba(255,255,255,0.12)",
+                display: "flex",
+                flexDirection: "column",
+                gap: 6,
+              }}
+            >
+              <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 10 }}>
+                <span
+                  style={{
+                    fontSize: 15,
+                    fontWeight: 700,
+                    letterSpacing: "0.05em",
+                    textTransform: "uppercase",
+                    color: nodeColor,
+                  }}
+                >
+                  {timeTag}
+                </span>
+                {metricVal !== undefined && (
+                  <span style={{ fontSize: 16, fontWeight: 700, color: nodeColor }}>
+                    {metricVal}
+                    {props.unit ? ` ${props.unit}` : ""}
+                  </span>
+                )}
+              </div>
+              <div style={{ fontSize: 24, fontWeight: 700, lineHeight: 1.3 }}>{step}</div>
+            </div>
+          </div>
+        );
+      })}
+    </div>
+  );
+};
+
 const DiagramSceneView: React.FC<{
   template: DiagramTemplate;
   props: DiagramProps;
@@ -40,6 +364,15 @@ const DiagramSceneView: React.FC<{
   const values = props.values ?? [25, 62, 96];
   const maxVal = Math.max(...values, 1);
   const steps = props.steps ?? ["Signal Capture", "Core Transform", "Verified Output"];
+
+  const badgeLabel =
+    template === "BarCompare"
+      ? "Data Comparison"
+      : template === "StatCallout"
+        ? "Key Metric"
+        : template === "TimelineFlow"
+          ? "Timeline Flow"
+          : "Process Model";
 
   return (
     <AbsoluteFill
@@ -75,7 +408,7 @@ const DiagramSceneView: React.FC<{
             marginBottom: 14,
           }}
         >
-          {template === "BarCompare" ? "Data Comparison" : template === "StatCallout" ? "Key Metric" : "Process Model"}
+          {badgeLabel}
         </div>
         <div style={{ fontSize: 46, fontWeight: 800, lineHeight: 1.12 }}>{props.title}</div>
         {props.subtitle ? (
@@ -124,7 +457,7 @@ const DiagramSceneView: React.FC<{
         </div>
       )}
 
-      {(template === "StepBreakdown" || template === "TimelineFlow") && (
+      {template === "StepBreakdown" && (
         <div style={{ display: "flex", flexDirection: "column", gap: 18 }}>
           {steps.map((step, idx) => {
             const prog = spring({ frame: Math.max(0, frame - idx * 8), fps, config: { damping: 15 } });
@@ -167,6 +500,8 @@ const DiagramSceneView: React.FC<{
           })}
         </div>
       )}
+
+      {template === "TimelineFlow" && <TimelineFlowView props={props} palette={palette} />}
 
       {template === "StatCallout" && (
         <div
