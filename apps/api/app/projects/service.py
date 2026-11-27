@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import uuid
 
+from sqlalchemy import and_, case, func
 from sqlalchemy.orm import Session
 
 from app.core.config import get_settings
@@ -10,7 +11,8 @@ from app.director.service import build_deterministic_storyboard, storyboard_to_t
 from app.events.service import emit_event
 from app.identity.service import ensure_default_owner
 from app.jobs.service import enqueue_job
-from app.models import Asset, Project, Scene, TimelineRevision
+from app.models import Asset, Job, Project, QAReview, Scene, TimelineRevision
+from app.qa.service import CLIP_MODELS
 from app.projects.schemas import ProjectCreateRequest, ProjectDetailRead, ProjectSummaryRead
 from app.timeline.schemas import TimelineCommand
 from app.timeline.service import apply_timeline_commands, get_latest_timeline, sync_scenes_projection
@@ -148,3 +150,33 @@ def approve_scene_and_dispatch(db: Session, project: Project, scene_id: str) -> 
         queued_job_id = job.id
         db.commit()
     return {"ok": True, "scene_id": scene_id, "queued_job_id": queued_job_id}
+
+def project_qa_analytics(db: Session, project_id: str) -> dict:
+    # A review describes a particular render. Editing a scene's model later must
+    # never reattribute old results. Legacy keyframes were all rendered by Qwen.
+    model = case(
+        *[(Job.job_type == job_type, name) for job_type, name in CLIP_MODELS.items()],
+        (Asset.kind == "keyframe", "qwen_image"),
+    )
+    rows = (
+        db.query(
+            model,
+            func.count(QAReview.id),
+            func.sum(case((QAReview.verdict == "passed", 1), else_=0)),
+            func.sum(case((QAReview.fix_action.in_(["rerender_clip", "rewrite_prompt_and_reseed"]), 1), else_=0)),
+        )
+        .select_from(QAReview)
+        .outerjoin(Job, and_(Job.id == QAReview.id, Job.project_id == QAReview.project_id))
+        .outerjoin(Asset, and_(Asset.id == QAReview.asset_id, Asset.project_id == QAReview.project_id))
+        .filter(QAReview.project_id == project_id, QAReview.verdict != "superseded")
+        .group_by(model)
+        .all()
+    )
+    models = {
+        name: {"reviews": 0, "passed": 0, "pass_rate": None, "retry_count": 0}
+        for name in (*CLIP_MODELS.values(), "qwen_image")
+    }
+    for name, total, passed, retries in rows:
+        if name in models:
+            models[name] = {"reviews": total, "passed": passed, "pass_rate": passed / total, "retry_count": retries}
+    return {"project_id": project_id, "models": models}

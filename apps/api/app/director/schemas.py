@@ -32,7 +32,7 @@ class PlannedStoryboard(BaseModel):
 
 class PlanRequest(BaseModel):
     script_override: str | None = None
-    brain_mode: Literal["gemini_auto", "chatgpt_bridge", "openai_api"] | None = None
+    brain_mode: Literal["gemini_auto", "chatgpt_bridge", "openai_api", "colab_ai"] | None = None
 
 
 class ChatGPTImportRequest(BaseModel):

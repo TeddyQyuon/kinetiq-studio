@@ -6,9 +6,9 @@ import uuid
 
 from sqlalchemy.orm import Session
 
-from app.core.config import get_settings
-from app.core.errors import NotFoundError, QuotaConfirmationRequiredError, ValidationFailedError
-from app.director.providers import GeminiProvider, convert_tool_calls_to_commands
+from app.core.errors import ConflictError, NotFoundError, QuotaConfirmationRequiredError, ValidationFailedError
+from app.director.providers import convert_tool_calls_to_commands, get_brain_provider
+from app.director.review import review_draft
 from app.director.schemas import (
     CopilotProposalResponse,
     DirectorBriefResponse,
@@ -137,8 +137,12 @@ def storyboard_to_timeline(project: Project, plan: PlannedStoryboard, revision: 
     cursor = 0
     visual: list[VisualSceneItem] = []
 
+    # Scene.id is a global primary key. Retain IDs already referenced by legacy
+    # assets/reviews, and scope new IDs so different projects can share a database.
+    existing_ids = {scene.id for scene in project.scenes}
     for idx, spec in enumerate(plan.scenes, start=1):
-        sid = f"scn_{idx:03d}"
+        legacy_id = f"scn_{idx:03d}"
+        sid = legacy_id if legacy_id in existing_ids else f"{project.id}_{legacy_id}"
         dur = max(2500, spec.duration_ms)
         is_diagram = spec.kind == "diagram"
         visual.append(
@@ -200,34 +204,23 @@ async def plan_project_storyboard(
     script_override: str | None = None,
     brain_mode: str | None = None,
 ) -> TimelineDocument:
-    settings = get_settings()
     mode = brain_mode or project.brain_mode
-
-    if mode == "gemini_auto" and settings.gemini_api_key:
+    provider = None if mode == "chatgpt_bridge" else get_brain_provider(mode)
+    inputs = dict(
+        topic=project.topic,
+        aspect=project.aspect,
+        duration_preset=project.duration_preset,
+        script_override=script_override,
+    )
+    if provider:
         try:
-            provider = GeminiProvider(settings.gemini_api_key, settings.gemini_pro_model)
-            plan = await provider.generate_storyboard(
-                db,
-                project_id=project.id,
-                topic=project.topic,
-                aspect=project.aspect,
-                duration_preset=project.duration_preset,
-                script_override=script_override,
-            )
+            plan = await provider.generate_storyboard(db, project_id=project.id, **inputs)
         except Exception:
-            plan = build_deterministic_storyboard(
-                topic=project.topic,
-                aspect=project.aspect,
-                duration_preset=project.duration_preset,
-                script_override=script_override,
-            )
+            if mode != "gemini_auto":
+                raise
+            plan = build_deterministic_storyboard(**inputs)
     else:
-        plan = build_deterministic_storyboard(
-            topic=project.topic,
-            aspect=project.aspect,
-            duration_preset=project.duration_preset,
-            script_override=script_override,
-        )
+        plan = build_deterministic_storyboard(**inputs)
 
     doc = storyboard_to_timeline(project, plan, project.current_revision)
     project.status = "planned"
@@ -272,7 +265,7 @@ async def create_copilot_proposal(
     message: str,
     selected_scene_id: str | None = None,
 ) -> CopilotProposalResponse:
-    settings = get_settings()
+    provider = get_brain_provider(project.brain_mode)
     doc = get_latest_timeline(db, project.id)
 
     summary = {
@@ -292,12 +285,17 @@ async def create_copilot_proposal(
         ],
     }
 
-    if settings.gemini_api_key:
-        provider = GeminiProvider(settings.gemini_api_key, settings.gemini_pro_model)
+    wants_review = False
+    if provider:
         assistant_msg, tool_calls = await provider.copilot_propose(
             db, project_id=project.id, timeline_summary=summary, user_message=message
         )
+        wants_review = any(call.get("name") == "review_draft" for call in tool_calls[:25])
         raw_cmds = convert_tool_calls_to_commands(tool_calls)
+    elif re.search(r"\b(review|critique)\b|review_draft", message, re.I):
+        wants_review = True
+        raw_cmds = []
+        assistant_msg = ""
     else:
         # Phase 0 offline heuristic command parser so Copilot UI is immediately testable
         raw_cmds = []
@@ -338,6 +336,17 @@ async def create_copilot_proposal(
             )
         assistant_msg = f"Prepared {len(raw_cmds)} previewable timeline command(s) for review."
 
+    if wants_review:
+        critique = await review_draft(db, project, doc, provider)
+        assistant_msg = "\n".join(
+            f"{label}: {critique[key]}"
+            for label, key in (
+                ("Pacing", "pacing"),
+                ("Hook retention", "hook_retention"),
+                ("Diagram density", "diagram_density"),
+            )
+        )
+
     # Validate commands strictly through TimelineCommand Pydantic union
     validated: list[TimelineCommand] = []
     temp_doc = doc
@@ -367,8 +376,8 @@ async def create_copilot_proposal(
         AIRun(
             id=proposal_id,
             project_id=project.id,
-            provider="gemini" if settings.gemini_api_key else "offline_copilot",
-            model=settings.gemini_pro_model if settings.gemini_api_key else "heuristic",
+            provider=provider.name if provider else "offline_copilot",
+            model=provider.model if provider else "heuristic",
             task="copilot_proposal",
             prompt_hash=str(hash(message))[:16],
             outcome="ok",
@@ -401,7 +410,12 @@ def accept_copilot_proposal(
 
     from pydantic import TypeAdapter
     cmds = [TypeAdapter(TimelineCommand).validate_python(c) for c in run.proposal_payload["commands"]]
-    updated = apply_timeline_commands(db, project_id, expected_revision, cmds, author="ai")
+    if cmds:
+        updated = apply_timeline_commands(db, project_id, expected_revision, cmds, author="ai")
+    else:
+        updated = get_latest_timeline(db, project_id)
+        if updated.revision != expected_revision:
+            raise ConflictError("The timeline revision has changed.")
     run.proposal_status = "accepted"
     run.proposal_payload = {**run.proposal_payload, "status": "accepted"}
     db.commit()

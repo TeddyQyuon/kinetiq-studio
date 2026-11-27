@@ -5,6 +5,11 @@ from typing import Any
 # Canonical tool definitions shared across Gemini Function Calling, Copilot, and Antigravity MCP.
 COPILOT_TOOL_SPECS: list[dict[str, Any]] = [
     {
+        "name": "review_draft",
+        "description": "Critique pacing, hook retention and diagram density across the whole current timeline.",
+        "parameters": {"type": "object", "properties": {}},
+    },
+    {
         "name": "trim_scene",
         "description": "Adjust the start_ms and end_ms boundaries of an existing scene.",
         "parameters": {
