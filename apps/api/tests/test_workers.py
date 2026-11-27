@@ -286,3 +286,237 @@ def test_resumable_upload_recovers_final_drive_id(worker_modules, monkeypatch, t
         (f"bytes {size}-{total - 1}/{total}", "Bearer new", 4),
         (f"bytes */{total}", "Bearer new", 0),
     ]
+
+
+def test_bootstrap_cli_reuse_rotation_and_explicit_token(tmp_path):
+    import os
+    import sqlite3
+    import stat
+    import sys
+
+    from app.core.crypto import hash_token
+
+    file = tmp_path / "tokens/media.token"
+    database = tmp_path / "bootstrap.db"
+    env = {**os.environ, "DATABASE_URL": f"sqlite:///{database}", "MEDIA_WORKER_TOKEN": ""}
+    cmd = [sys.executable, "-m", "app.workers.bootstrap", "--name", "local-media", "--profile", "media_local",
+           "--capabilities", "tts,align,transcode", "--token-file", str(file), "--json"]
+
+    def run(*extra):
+        output = subprocess.check_output([*cmd, *extra], env=env, cwd=Path(__file__).resolve().parents[1], text=True)
+        token = file.read_text().strip()
+        assert token.startswith("wrk_") and token not in output
+        if os.name == "posix":
+            assert stat.S_IMODE(file.stat().st_mode) == 0o600
+        with sqlite3.connect(database) as db:
+            [(worker_id, digest, caps)] = db.execute("SELECT id, token_hash, capabilities FROM workers")
+        assert digest == hash_token(token) and json.loads(caps) == ["tts", "align", "transcode"]
+        metadata = json.loads(output)
+        assert metadata["worker_id"] == worker_id
+        return metadata, token
+
+    first, original = run()
+    mtime = file.stat().st_mtime_ns
+    if os.name == "posix":
+        file.chmod(0o644)
+    second, reused = run()
+    assert second["reused"] and reused == original and file.stat().st_mtime_ns == mtime
+    file.write_text("wrk_mismatched")
+    rotated, fresh = run()
+    assert rotated["worker_id"] == first["worker_id"] and fresh not in {original, "wrk_mismatched"}
+    file.unlink()
+    assert run()[1] != fresh
+    env["MEDIA_WORKER_TOKEN"] = "wrk_from_environment"
+    assert run()[1] == env["MEDIA_WORKER_TOKEN"]
+    assert run("--token", "wrk_explicit")[1] == "wrk_explicit"
+
+
+@pytest.mark.parametrize("runner_name", ["media", "render"])
+@pytest.mark.parametrize("source", ["cli", "env_file", "bearer"])
+def test_worker_entrypoint_token_resolution(worker_modules, monkeypatch, tmp_path, runner_name, source):
+    import importlib
+    import sys
+    from unittest.mock import Mock
+
+    runner = importlib.import_module(f"workers.{runner_name}.runner")
+    token_file = tmp_path / "worker.token"
+    token_file.write_text("wrk_from_file\n")
+    args = ["worker"]
+    monkeypatch.setenv("API_BASE_URL", "http://api:8000")
+    monkeypatch.delenv("WORKER_TOKEN", raising=False)
+    monkeypatch.setenv("WORKER_TOKEN_FILE", str(tmp_path / "missing"))
+    if source == "cli":
+        args += ["--token-file", str(token_file)]
+    elif source == "env_file":
+        monkeypatch.setenv("WORKER_TOKEN_FILE", str(token_file))
+    else:
+        monkeypatch.setenv("WORKER_TOKEN", "wrk_env")
+    monkeypatch.setattr(sys, "argv", args)
+    client = Mock()
+    client.return_value.claim_job.side_effect = KeyboardInterrupt
+    monkeypatch.setattr(runner, "WorkerClient", client)
+    with pytest.raises(KeyboardInterrupt):
+        runner.main()
+    client.assert_called_once_with("http://api:8000", "wrk_env" if source == "bearer" else "wrk_from_file")
+    client.return_value.register.assert_called_once()
+
+
+def test_split_clip_reaches_remotion_props(worker_modules, tmp_path, monkeypatch):
+    from unittest.mock import MagicMock
+
+    from workers.render import runner
+
+    scenes = [
+        {"id": "left", "kind": "ai_video", "assets": {"master": "shared"}, "start_ms": 0,
+         "end_ms": 750, "source_start_ms": 0, "narration": ""},
+        {"id": "right", "kind": "ai_video", "assets": {"master": "shared"}, "start_ms": 750,
+         "end_ms": 1250, "source_start_ms": 1625, "narration": ""},
+    ]
+    document = {"format": {"aspect": "16:9", "fps": 24}, "tracks": {
+        "visual": scenes, "voice": [], "captions": {}, "overlays": [], "music": {}}}
+    job = {"id": "split", "payload": {"resolution": "720p", "document": document, "media_urls": {}}}
+    monkeypatch.setattr(runner, "download_inputs", lambda *a: {"shared": tmp_path / "original.mp4"})
+    monkeypatch.setattr(runner, "master_audio_video", lambda *a: None)
+    captured = []
+
+    def render(args, **kwargs):
+        assert args[args.index("render") + 1:args.index("render") + 3] == [str(runner.ENTRY_POINT), "EduComposition"]
+        path = next(arg.removeprefix("--props=") for arg in args if arg.startswith("--props="))
+        captured.append(json.loads(Path(path).read_text()))
+
+    monkeypatch.setattr(runner.subprocess, "run", render)
+    runner.render_job(MagicMock(), job)
+    [props] = captured
+    assert props["document"]["tracks"]["visual"] == scenes
+    assert props["mediaFiles"] == {"shared": "original.mp4"} and props["durationInFrames"] == 30
+
+
+@pytest.mark.parametrize("free_status", [200, 503])
+def test_comfy_oom_reports_structured_failure_and_keeps_polling(worker_modules, monkeypatch, tmp_path, free_status):
+    import sys
+    from unittest.mock import MagicMock, Mock
+
+    import httpx
+    from workers.gpu import runner
+
+    job = {"id": "job", "job_type": "keyframe_qwen", "comfy_graph": {}}
+    ws = Mock()
+    ws.recv.return_value = json.dumps({"type": "execution_error", "data": {
+        "prompt_id": "prompt", "exception_type": "torch.OutOfMemoryError",
+        "exception_message": "Allocation on device", "node_type": "KSampler"}})
+    monkeypatch.setitem(sys.modules, "websocket", Mock(create_connection=Mock(return_value=ws)))
+    calls = []
+
+    def serve(request):
+        calls.append((request.url.path, json.loads(request.content)))
+        if request.url.path == "/prompt":
+            return httpx.Response(200, json={"prompt_id": "prompt"})
+        return httpx.Response(free_status if request.url.path == "/free" else 200)
+
+    session = httpx.Client(transport=httpx.MockTransport(serve))
+    cleanup_session = httpx.Client(transport=httpx.MockTransport(serve))
+    monkeypatch.setattr(runner.httpx, "Client", lambda **kwargs: session)
+    monkeypatch.setattr(runner.httpx, "post", cleanup_session.post)
+    monkeypatch.setenv("API_BASE_URL", "http://api")
+    monkeypatch.setenv("WORKER_TOKEN", "wrk_gpu")
+    monkeypatch.setattr(sys, "argv", ["worker", "--provider", "local"])
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(runner, "detect_gpu", lambda: ("L4", 24))
+    worker = MagicMock()
+    worker.claim_job.side_effect = [job, KeyboardInterrupt]
+    monkeypatch.setattr(runner, "WorkerClient", lambda *a: worker)
+    with pytest.raises(KeyboardInterrupt):
+        runner.main()
+    ws.close.assert_called_once()
+    assert calls[1:] == [("/queue", {"delete": ["prompt"]}), ("/free", {"unload_models": True, "free_memory": True})]
+    job_id, error = worker.fail_job.call_args.args
+    meta = json.loads(error)
+    assert job_id == "job" and meta["code"] == "cuda_oom" and meta["node_type"] == "KSampler"
+    assert meta["cleanup"] == {"queue": True, "free": free_status == 200}
+    assert worker.claim_job.call_count == 2
+    cleanup_session.close()
+
+
+def test_docker_worker_routes_signed_inputs_and_uploads(worker_modules, monkeypatch, tmp_path):
+    import httpx
+    from kinetiq_agent_core import worker_client
+
+    public, internal = "http://localhost:8000", "http://api:8000"
+    signed = "/v1/media/clip?t=expiry.signature"
+    drive = "https://www.googleapis.com/upload/drive/v3/files?upload_id=id"
+    uploads = iter([("local", public + "/v1/storage/uploads/id"), ("drive", drive)])
+
+    def api(request):
+        assert request.url.host == "api"
+        if request.url.path.endswith("/claim"):
+            return httpx.Response(200, json={"input_download_url": public + signed,
+                                            "payload": {"media_urls": {"clip": public + signed, "remote": drive}}})
+        provider, uri = next(uploads)
+        return httpx.Response(200, json={"provider": provider, "storage_key": "key", "session_uri": uri})
+
+    monkeypatch.setenv("PUBLIC_API_URL", public)
+    transport = httpx.Client(transport=httpx.MockTransport(api))
+    monkeypatch.setattr(worker_client.httpx, "Client", lambda **kwargs: transport)
+    seen = []
+
+    def upload(path, **kwargs):
+        seen.append(kwargs["session_uri"])
+        return {"size_bytes": path.stat().st_size}
+
+    monkeypatch.setattr(worker_client, "upload_file_resumable", upload)
+    wc = worker_client.WorkerClient(internal, "wrk_demo")
+    wc.worker_id = "worker"
+    job = wc.claim_job(["render"])
+    assert job["input_download_url"] == internal + signed
+    assert job["payload"]["media_urls"] == {"clip": internal + signed, "remote": drive}
+    output = tmp_path / "asset"
+    output.write_bytes(b"media")
+    for _ in range(2):
+        wc.upload_artifact("job", output, asset_kind="audio", content_type="audio/wav")
+    assert seen == [internal + "/v1/storage/uploads/id", drive]
+    transport.close()
+
+
+@pytest.mark.skipif(not all(shutil.which(cmd) for cmd in ("ffmpeg", "ffprobe")), reason="FFmpeg required")
+def test_renderer_masters_silent_timeline(worker_modules, tmp_path):
+    from workers.render.runner import master_audio_video
+
+    picture, output = tmp_path / "silent.mp4", tmp_path / "final.mp4"
+    subprocess.run(["ffmpeg", "-v", "error", "-f", "lavfi", "-i", "color=s=160x90:r=24:d=0.5",
+                    "-c:v", "libx264", "-threads", "1", str(picture)], check=True)
+    master_audio_video(picture, {"voice": [], "music": {}}, {}, 0.5, output)
+    codecs = subprocess.check_output(["ffprobe", "-v", "error", "-show_entries", "stream=codec_name",
+                                      "-of", "csv=p=0", str(output)], text=True)
+    assert codecs.splitlines() == ["h264", "aac"]
+
+
+def test_concurrent_first_boot_creates_one_identity(monkeypatch, tmp_path):
+    from concurrent.futures import ThreadPoolExecutor
+    from threading import Barrier
+
+    from sqlalchemy.orm import sessionmaker
+
+    from app.core import db
+    from app.core.crypto import hash_token
+    from app.models import Worker
+    from app.workers import bootstrap
+
+    engine = create_engine(f"sqlite:///{tmp_path / 'fresh.db'}")
+    sessions = sessionmaker(bind=engine)
+    monkeypatch.setattr(db, "engine", engine)
+    monkeypatch.setattr(bootstrap, "SessionLocal", sessions)
+    path = tmp_path / "worker.token"
+    start = Barrier(4)
+
+    def boot():
+        start.wait(timeout=10)
+        return bootstrap.bootstrap("worker", "media", ["tts"], path)
+
+    with ThreadPoolExecutor(4) as pool:
+        results = [f.result(timeout=15) for f in [pool.submit(boot) for _ in range(4)]]
+    with sessions() as session:
+        worker = session.query(Worker).one()
+        assert worker.token_hash == hash_token(path.read_text().strip())
+        assert {result["worker_id"] for result in results} == {worker.id}
+    assert sum(result["reused"] for result in results) == 3
+    engine.dispose()
