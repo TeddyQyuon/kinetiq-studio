@@ -12,7 +12,6 @@ from typing import Any
 
 import httpx
 import websocket
-
 from kinetiq_agent_core import WorkerClient
 
 PROFILE_CAPS: dict[str, list[str]] = {
@@ -37,9 +36,9 @@ def detect_gpu() -> tuple[str, int]:
         if out:
             name, mem_mb = [x.strip() for x in out.splitlines()[0].split(",", 1)]
             return name, max(1, round(int(mem_mb) / 1024))
-    except Exception:
-        pass
-    return "CPU-Mock", 0
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return "Unknown", 0
+    return "Unknown", 0
 
 
 def make_540p_proxy(master_mp4: Path, proxy_mp4: Path) -> Path:
@@ -70,6 +69,20 @@ def make_540p_proxy(master_mp4: Path, proxy_mp4: Path) -> Path:
     return proxy_mp4
 
 
+def make_mock_clip(path: Path, job: dict[str, Any]) -> None:
+    payload = job.get("payload") or {}
+    width, height = (3840, 2160) if job["job_type"].startswith("upscale") else (1920, 1080)
+    if payload.get("aspect") == "9:16":
+        width, height = height, width
+    seconds = max(1 / 24, payload.get("duration_ms", 1000) / 1000)
+    subprocess.run(
+        ["ffmpeg", "-v", "error", "-y", "-f", "lavfi", "-i", f"color=s={width}x{height}:r=24",
+         "-t", str(seconds), "-c:v", "libx264", "-preset", "ultrafast", "-threads", "2",
+         "-pix_fmt", "yuv420p", "-movflags", "+faststart", str(path)],
+        check=True,
+    )
+
+
 def execute_comfy_graph(
     client: WorkerClient,
     comfy_url: str,
@@ -91,11 +104,15 @@ def execute_comfy_graph(
             if isinstance(msg, bytes):
                 continue
             ev = json.loads(msg)
+            if ev.get("data", {}).get("prompt_id") != prompt_id:
+                continue
+            if ev.get("type") in {"execution_error", "execution_interrupted"}:
+                raise RuntimeError(ev["data"].get("exception_message") or ev["type"])
             if ev.get("type") == "progress":
                 d = ev["data"]
                 pct = int(100 * d["value"] / max(d["max"], 1))
                 client.report_progress(job_id, pct, step=d["value"], total_steps=d["max"])
-            elif ev.get("type") == "executing" and ev["data"].get("node") is None and ev["data"].get("prompt_id") == prompt_id:
+            elif ev.get("type") == "executing" and ev["data"].get("node") is None:
                 break
     finally:
         ws.close()
@@ -152,8 +169,8 @@ def main() -> None:
                     try:
                         from google.colab import runtime  # type: ignore
                         runtime.unassign()
-                    except Exception:
-                        pass
+                    except ImportError:
+                        print("Colab runtime unavailable; stopping the worker.")
                     break
                 time.sleep(3)
                 continue
@@ -162,58 +179,50 @@ def main() -> None:
             job_id = job["id"]
             t0 = time.time()
             try:
-                if args.mock:
-                    for pct in (25, 65, 100):
-                        time.sleep(0.5)
-                        wc.report_progress(job_id, pct)
-
-                    if job["job_type"] == "keyframe_qwen":
-                        kf = work_dir / f"{job['scene_id'] or job_id}_kf.png"
-                        kf.write_bytes(TINY_PNG)
-                        art = wc.upload_artifact(
-                            job_id, kf, asset_kind="keyframe", content_type="image/png", width=1920, height=1080
-                        )
-                        wc.complete_job(job_id, [art], gpu_seconds=time.time() - t0)
-                        kf.unlink(missing_ok=True)
+                with wc.keep_lease(job_id):
+                    is_keyframe = job["job_type"] == "keyframe_qwen"
+                    if args.mock:
+                        if is_keyframe:
+                            out_path = work_dir / f"{job_id}.png"
+                            out_path.write_bytes(TINY_PNG)
+                        else:
+                            out_path = work_dir / f"{job_id}.mp4"
+                            make_mock_clip(out_path, job)
                     else:
-                        master = work_dir / f"{job['scene_id'] or job_id}_master.mp4"
-                        proxy = work_dir / f"{job['scene_id'] or job_id}_proxy.mp4"
-                        master.write_bytes(b"\x00\x00\x00\x18ftypmp42\x00\x00\x00\x00mp42isomMOCKVIDEO")
-                        proxy.write_bytes(b"\x00\x00\x00\x18ftypmp42\x00\x00\x00\x00mp42isomMOCKPROXY")
-                        a1 = wc.upload_artifact(job_id, master, asset_kind="master", content_type="video/mp4", width=1920, height=1088)
-                        a2 = wc.upload_artifact(job_id, proxy, asset_kind="proxy", content_type="video/mp4", width=960, height=544)
-                        wc.complete_job(job_id, [a1, a2], gpu_seconds=time.time() - t0)
-                        master.unlink(missing_ok=True)
-                        proxy.unlink(missing_ok=True)
-                else:
-                    if job.get("input_download_url") and job.get("input_filename"):
-                        comfy_input.mkdir(parents=True, exist_ok=True)
-                        with httpx.Client(timeout=60) as hc:
-                            r = hc.get(job["input_download_url"])
-                            r.raise_for_status()
-                            (comfy_input / job["input_filename"]).write_bytes(r.content)
+                        if job.get("input_download_url") and job.get("input_filename"):
+                            comfy_input.mkdir(parents=True, exist_ok=True)
+                            filename = job["input_filename"]
+                            if Path(filename).name != filename:
+                                raise ValueError("Expected a plain ComfyUI input filename")
+                            with httpx.stream("GET", job["input_download_url"], timeout=60, follow_redirects=True) as r:
+                                r.raise_for_status()
+                                with (comfy_input / filename).open("wb") as dest:
+                                    for chunk in r.iter_bytes():
+                                        dest.write(chunk)
+                        out_path = execute_comfy_graph(wc, args.comfy_url, comfy_output, job_id, job["comfy_graph"])
 
-                    out_path = execute_comfy_graph(wc, args.comfy_url, comfy_output, job_id, job["comfy_graph"])
-                    if job["job_type"] == "keyframe_qwen":
-                        art = wc.upload_artifact(job_id, out_path, asset_kind="keyframe", content_type="image/png")
-                        wc.complete_job(job_id, [art], gpu_seconds=time.time() - t0)
+                    if is_keyframe:
+                        artifacts = [wc.upload_artifact(job_id, out_path, asset_kind="keyframe", content_type="image/png")]
                     else:
                         kind = "upscaled_4k" if job["job_type"].startswith("upscale") else "master"
                         proxy_path = work_dir / f"{out_path.stem}_proxy.mp4"
                         make_540p_proxy(out_path, proxy_path)
                         a_master = wc.upload_artifact(job_id, out_path, asset_kind=kind, content_type="video/mp4")
                         a_proxy = wc.upload_artifact(job_id, proxy_path, asset_kind="proxy", content_type="video/mp4")
-                        wc.complete_job(job_id, [a_master, a_proxy], gpu_seconds=time.time() - t0)
-                        proxy_path.unlink(missing_ok=True)
-                    out_path.unlink(missing_ok=True)
-            except Exception as exc:
+                        artifacts = [a_master, a_proxy]
+                wc.complete_job(job_id, artifacts, gpu_seconds=time.time() - t0)
+                if not is_keyframe:
+                    proxy_path.unlink(missing_ok=True)
+                out_path.unlink(missing_ok=True)
+            except Exception as exc:  # noqa: BLE001 - isolate failed jobs and continue polling.
                 wc.fail_job(job_id, str(exc))
             finally:
+                last_work = time.time()
                 if not args.mock:
                     try:
                         httpx.post(f"{args.comfy_url}/free", json={"unload_models": False, "free_memory": True}, timeout=5)
-                    except Exception:
-                        pass
+                    except httpx.RequestError as exc:
+                        print(f"ComfyUI memory cleanup unavailable: {exc}")
     finally:
         wc.stop_heartbeat()
 

@@ -68,7 +68,7 @@ class JobClaimResponse(BaseModel):
 
 
 class JobProgressRequest(BaseModel):
-    percent: int = Field(ge=0, le=100)
+    percent: int | None = Field(default=None, ge=0, le=100)
     step: int | None = None
     total_steps: int | None = None
 

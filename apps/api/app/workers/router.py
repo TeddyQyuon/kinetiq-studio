@@ -3,20 +3,23 @@ from __future__ import annotations
 from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, Header, Response
+from sqlalchemy import update
 from sqlalchemy.orm import Session
 
 from app.core.config import get_settings
-from app.core.crypto import generate_token, hash_token, sign_media_token
+from app.core.crypto import generate_token, hash_token
 from app.core.db import get_db
-from app.core.errors import NotFoundError, UnauthorizedError
+from app.core.errors import ConflictError, NotFoundError, UnauthorizedError, ValidationFailedError
 from app.events.service import emit_event
+from app.exports.service import finish_export
 from app.identity.service import ensure_default_owner, get_valid_google_access_token
 from app.jobs.service import claim_next_job, enqueue_job, estimate_colab_cu, fail_job, renew_job_lease
-from app.models import Asset, Job, Project, Scene, Worker
+from app.models import Asset, Job, Project, Worker
 from app.qa.service import evaluate_keyframe_with_hotl
 from app.storage.drive import get_storage_provider
 from app.timeline.schemas import SceneAssetRefs, SceneQASummary
 from app.timeline.service import get_latest_timeline, save_timeline_document
+from app.workers.claims import UPSCALE_JOBS, VIDEO_JOBS, build_claim
 from app.workers.schemas import (
     JobClaimRequest,
     JobClaimResponse,
@@ -32,7 +35,7 @@ from app.workers.schemas import (
     WorkerTokenCreateRequest,
     WorkerTokenCreateResponse,
 )
-from app.workers.workflows import PROFILE_CAPABILITIES, build_comfy_graph
+from app.workers.workflows import PROFILE_CAPABILITIES
 
 router = APIRouter(prefix="/v1/workers", tags=["workers"])
 
@@ -145,53 +148,54 @@ def claim_job(
     worker: Worker = Depends(_auth_worker),
     db: Session = Depends(get_db),
 ):
-    settings = get_settings()
     caps = body.capabilities or worker.capabilities or []
     job = claim_next_job(db, worker, caps)
     if not job:
         return Response(status_code=204)
-
+    try:
+        claim = build_claim(db, job, worker)
+    except (NotFoundError, ValidationFailedError) as exc:
+        # A bad input belongs to this job. Keep the worker polling other jobs.
+        fail_job(db, job, str(exc))
+        return Response(status_code=204)
     worker.status = "busy"
     worker.last_heartbeat = datetime.now(timezone.utc)
     db.commit()
+    return claim
 
-    doc = get_latest_timeline(db, job.project_id)
-    scene = next((s for s in doc.tracks.visual if s.id == job.scene_id), None)
 
-    input_download_url: str | None = None
-    input_filename: str | None = None
-    if scene and job.job_type in {"i2v_ltx25", "i2v_wan22"} and scene.assets and scene.assets.keyframe:
-        tok = sign_media_token(scene.assets.keyframe, ttl_seconds=600)
-        input_download_url = f"{settings.public_api_url.rstrip('/')}/v1/media/{scene.assets.keyframe}?t={tok}"
-        input_filename = f"{scene.id}_keyframe.png"
-    elif scene and job.job_type == "upscale_flashvsr" and scene.assets and scene.assets.master:
-        tok = sign_media_token(scene.assets.master, ttl_seconds=600)
-        input_download_url = f"{settings.public_api_url.rstrip('/')}/v1/media/{scene.assets.master}?t={tok}"
-        input_filename = f"{scene.id}_master.mp4"
+def _owned_job(db: Session, job_id: str, worker: Worker, *, allow_completed: bool = False) -> Job:
+    job = db.get(Job, job_id)
+    if not job:
+        raise NotFoundError(f"Job {job_id} not found")
+    if job.worker_id != worker.id or (
+        job.status not in {"leased", "running"} and not (allow_completed and job.status == "succeeded")
+    ):
+        raise ConflictError("This worker no longer holds the job lease")
+    return job
 
-    comfy_graph = None
-    if scene and job.job_type in {"keyframe_qwen", "i2v_ltx25", "i2v_wan22", "upscale_flashvsr"}:
-        comfy_graph = build_comfy_graph(
-            job_type=job.job_type,
-            scene=scene,
-            aspect=doc.format.aspect,
-            target_res=doc.format.target,
-            style_look=doc.style_bible.look,
-            negative_prompt=doc.style_bible.negative,
-            input_filename=input_filename,
+
+def _lock_lease(db: Session, job: Job, worker: Worker, *, allow_completed: bool = False) -> bool:
+    # A conditional write serializes renewal, failure and completion with reassignment
+    # on SQLite as well as PostgreSQL. The caller holds the lock until commit.
+    held = db.execute(
+        update(Job)
+        .where(
+            Job.id == job.id,
+            Job.worker_id == worker.id,
+            Job.attempts == job.attempts,
+            Job.status.in_(["leased", "running"]),
+            Job.lease_until > datetime.now(timezone.utc),
         )
-
-    return JobClaimResponse(
-        id=job.id,
-        project_id=job.project_id,
-        scene_id=job.scene_id,
-        job_type=job.job_type,
-        capability=job.capability,
-        payload=job.payload,
-        input_download_url=input_download_url,
-        input_filename=input_filename,
-        comfy_graph=comfy_graph,
+        .values(status="running")
+        .execution_options(synchronize_session=False)
     )
+    if held.rowcount == 1:
+        return True
+    db.refresh(job)
+    if allow_completed and job.status == "succeeded" and job.worker_id == worker.id:
+        return False
+    raise ConflictError("Job lease expired or changed")
 
 
 @router.post("/jobs/{job_id}/progress")
@@ -201,12 +205,30 @@ def report_progress(
     worker: Worker = Depends(_auth_worker),
     db: Session = Depends(get_db),
 ) -> dict[str, bool]:
-    job = db.query(Job).filter(Job.id == job_id).first()
-    if not job:
-        raise NotFoundError(f"Job {job_id} not found")
+    job = _owned_job(db, job_id, worker)
+    _lock_lease(db, job, worker)
     worker.last_heartbeat = datetime.now(timezone.utc)
-    renew_job_lease(db, job, body.percent)
+    renew_job_lease(db, job, job.progress_pct if body.percent is None else body.percent)
     return {"ok": True}
+
+
+SCOPED_JOBS = {"render", "tts", "align", "transcode", "upscale_seedvr2"}
+
+
+def _upload_prefix(job: Job, kind: str) -> str:
+    subdir = {
+        "keyframe": "keyframes",
+        "master": "clips/master",
+        "proxy": "clips/proxy",
+        "upscaled_4k": "clips/master",
+        "audio": "audio",
+        "export": "exports",
+        "srt": "exports",
+        "words": "audio",
+    }.get(kind, "clips/master")
+    if job.job_type in SCOPED_JOBS:
+        subdir = f"{subdir}/{job.id}/{job.attempts}"
+    return f"{job.project_id}/{subdir}/"
 
 
 @router.post("/jobs/{job_id}/upload-session", response_model=UploadSessionResponse)
@@ -216,9 +238,7 @@ async def create_upload_session(
     worker: Worker = Depends(_auth_worker),
     db: Session = Depends(get_db),
 ) -> UploadSessionResponse:
-    job = db.query(Job).filter(Job.id == job_id).first()
-    if not job:
-        raise NotFoundError(f"Job {job_id} not found")
+    job = _owned_job(db, job_id, worker)
     project = db.query(Project).filter(Project.id == job.project_id).first()
     if not project:
         raise NotFoundError(f"Project {job.project_id} not found")
@@ -232,15 +252,7 @@ async def create_upload_session(
         project.drive_folder_id = folder_id
         db.commit()
 
-    subdir = {
-        "keyframe": "keyframes",
-        "master": "clips/master",
-        "proxy": "clips/proxy",
-        "upscaled_4k": "clips/master",
-        "audio": "audio",
-        "export": "exports",
-    }.get(body.asset_kind, "clips/master")
-    storage_key = f"{project.id}/{subdir}/{body.filename}"
+    storage_key = _upload_prefix(job, body.asset_kind) + body.filename
 
     info = await provider.create_upload_session(
         user_id=user.id,
@@ -254,7 +266,7 @@ async def create_upload_session(
             "project_id": project.id,
             "scene_id": job.scene_id or "",
             "kind": body.asset_kind,
-            "revision": str(project.current_revision),
+            "revision": str(job.payload.get("revision", project.current_revision)),
         },
     )
     refresh_url = info.token_refresh_url.format(job_id=job.id) if info.token_refresh_url else None
@@ -274,6 +286,7 @@ async def refresh_upload_token(
     worker: Worker = Depends(_auth_worker),
     db: Session = Depends(get_db),
 ) -> dict[str, str]:
+    _owned_job(db, job_id, worker)
     settings = get_settings()
     if settings.storage_provider != "drive":
         return {"authorization": ""}
@@ -289,9 +302,7 @@ async def complete_job(
     worker: Worker = Depends(_auth_worker),
     db: Session = Depends(get_db),
 ) -> dict:
-    job = db.query(Job).filter(Job.id == job_id).first()
-    if not job:
-        raise NotFoundError(f"Job {job_id} not found")
+    job = _owned_job(db, job_id, worker, allow_completed=True)
 
     # Idempotency guard if worker retries /complete
     if job.status == "succeeded":
@@ -305,14 +316,39 @@ async def complete_job(
     provider = get_storage_provider(db)
     cu = estimate_colab_cu(worker.gpu_model, body.gpu_seconds)
 
-    created_assets: dict[str, Asset] = {}
+    expected = {"tts": "audio", "align": "words", "transcode": "proxy"}
+    kinds = [a.asset_kind for a in body.artifacts]
+    if job.job_type in expected and kinds != [expected[job.job_type]]:
+        raise ValidationFailedError(f"{job.job_type} requires one {expected[job.job_type]} artifact")
+    if job.job_type == "render" and sorted(kinds) != ["export", "srt"]:
+        raise ValidationFailedError("A render requires both an MP4 export and an SRT sidecar")
+
+    files = []
     for art in body.artifacts:
+        prefix = _upload_prefix(job, art.asset_kind)
+        if job.job_type in SCOPED_JOBS and (
+            not art.storage_key.startswith(prefix)
+            or "/" in art.storage_key[len(prefix):] or "\\" in art.storage_key
+            or art.storage_key[len(prefix):] in {"", ".", ".."}
+        ):
+            raise ValidationFailedError("Artifact does not belong to this upload attempt")
         verified = await provider.verify_uploaded_file(
             user_id=user.id,
             storage_key=art.storage_key,
             drive_file_id=art.drive_file_id,
             expected_size=art.size_bytes,
         )
+        if art.sha256 and verified.sha256 and art.sha256 != verified.sha256:
+            raise ValidationFailedError("Stored file checksum does not match upload")
+        files.append((art, verified))
+
+    # Verify uploads before taking the write lock. All asset,
+    # export and job updates below commit together.
+    if not _lock_lease(db, job, worker, allow_completed=True):
+        return {"ok": True, "already_completed": True}
+
+    created_assets: dict[str, Asset] = {}
+    for art, verified in files:
         ast = Asset(
             project_id=project.id,
             scene_id=job.scene_id,
@@ -343,15 +379,30 @@ async def complete_job(
     job.gpu_seconds = body.gpu_seconds
     job.est_cu = cu
     job.lease_until = None
-    job.result = {"asset_ids": {k: v.id for k, v in created_assets.items()}, **body.result_meta}
+    job.result = {**body.result_meta, "asset_ids": {k: v.id for k, v in created_assets.items()}}
 
     worker.status = "online"
     worker.last_heartbeat = datetime.now(timezone.utc)
     worker.cu_used_month = round((worker.cu_used_month or 0.0) + cu, 4)
 
+    if job.job_type == "render":
+        finish_export(db, job, created_assets)
+        db.commit()
+        return {"ok": True, "cu_charged": cu}
+    if job.job_type in {"tts", "align"}:
+        # Export jobs refer to the immutable inputs and outputs by job ID.
+        db.commit()
+        return {"ok": True, "cu_charged": cu}
+
     # Update TimelineDocument & trigger HOTL QA or next DAG stage
     doc = get_latest_timeline(db, project.id)
     scene_item = next((s for s in doc.tracks.visual if s.id == job.scene_id), None)
+
+    if (scene_item and job.job_type in UPSCALE_JOBS | {"transcode"}
+            and job.payload.get("master_asset_id")
+            and (not scene_item.assets or scene_item.assets.master != job.payload["master_asset_id"])):
+        # A newer master replaced this input. The pinned export can still use its result.
+        scene_item = None
 
     if scene_item:
         refs = scene_item.assets or SceneAssetRefs()
@@ -414,12 +465,17 @@ async def complete_job(
             else:
                 scene_item.status = "needs_review"
 
-        elif job.job_type in {"i2v_ltx25", "i2v_wan22", "upscale_flashvsr"}:
+        elif job.job_type in VIDEO_JOBS | UPSCALE_JOBS:
+            if "master" in created_assets and "proxy" not in created_assets:
+                enqueue_job(
+                    db, project_id=project.id, scene_id=scene_item.id, job_type="transcode",
+                    capability="transcode", payload={"master_asset_id": refs.master}, depends_on=[job.id],
+                )
             scene_item.status = "ready"
             if not scene_item.qa or scene_item.qa.verdict == "pending":
                 scene_item.qa = SceneQASummary(score=8.5, attempts=1, verdict="passed", reason="Clip rendered")
 
-        save_timeline_document(db, project, project.current_revision, doc, author="ai")
+        save_timeline_document(db, project, doc.revision, doc, author="ai")
     else:
         db.commit()
 
@@ -433,9 +489,8 @@ def report_fail(
     worker: Worker = Depends(_auth_worker),
     db: Session = Depends(get_db),
 ) -> dict[str, bool]:
-    job = db.query(Job).filter(Job.id == job_id).first()
-    if not job:
-        raise NotFoundError(f"Job {job_id} not found")
+    job = _owned_job(db, job_id, worker)
+    _lock_lease(db, job, worker)
     worker.status = "online"
     worker.last_heartbeat = datetime.now(timezone.utc)
     fail_job(db, job, body.error)

@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import logging
 import threading
+from collections.abc import Iterator
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
@@ -52,11 +55,40 @@ class WorkerClient:
                                 headers=self.headers,
                                 json={"worker_id": self.worker_id},
                             )
-                        except Exception:
-                            pass
+                        except httpx.HTTPError:
+                            logging.getLogger(__name__).warning("Worker heartbeat interrupted")
                     self._stop_evt.wait(interval_seconds)
 
         threading.Thread(target=_loop, daemon=True).start()
+
+    @contextmanager
+    def keep_lease(self, job_id: str, interval_seconds: int = 30) -> Iterator[None]:
+        """Keep the job leased while native rendering, model inference or uploads block."""
+        stop = threading.Event()
+        lost = threading.Event()
+        url = f"{self.api_url}/v1/workers/jobs/{job_id}/progress"
+        self.client.post(url, headers=self.headers, json={}).raise_for_status()
+
+        def renew() -> None:
+            while not stop.wait(interval_seconds):
+                try:
+                    response = self.client.post(url, headers=self.headers, json={})
+                    if response.status_code in {401, 404, 409}:
+                        lost.set()
+                        return
+                    response.raise_for_status()
+                except httpx.HTTPError:
+                    logging.getLogger(__name__).warning("Lease renewal interrupted for %s", job_id)
+
+        thread = threading.Thread(target=renew, daemon=True)
+        thread.start()
+        try:
+            yield
+        finally:
+            stop.set()
+            thread.join()
+        if lost.is_set():
+            raise RuntimeError(f"Lost lease for {job_id}")
 
     def stop_heartbeat(self) -> None:
         self._stop_evt.set()

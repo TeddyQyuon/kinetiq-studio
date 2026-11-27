@@ -1,0 +1,2 @@
+kokoro==0.9.4
+whisperx==3.8.5
