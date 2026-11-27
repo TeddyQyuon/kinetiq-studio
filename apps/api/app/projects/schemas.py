@@ -49,6 +49,7 @@ class ProjectDetailRead(ProjectSummaryRead):
 
 
 class SceneRegenerateRequest(BaseModel):
+    expected_revision: int | None = None
     prompt: str | None = None
     model: Literal["ltx25_fp8", "wan22_i2v", "qwen_image"] | None = None
     camera: Literal["static", "slow_dolly_in", "aerial_pullback", "cinematic_orbit", "macro_pan"] | None = None

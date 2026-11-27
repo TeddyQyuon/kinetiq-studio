@@ -81,6 +81,7 @@ export interface VisualSceneItem {
   id: string;
   start_ms: number;
   end_ms: number;
+  source_start_ms?: number;
   kind: SceneKind;
   narration: string;
   prompt?: ScenePromptBundle;

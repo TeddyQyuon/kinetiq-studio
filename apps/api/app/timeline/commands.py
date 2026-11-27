@@ -33,8 +33,18 @@ def apply_command(doc: TimelineDocument, cmd: TimelineCommand) -> tuple[Timeline
         idx = next((i for i, s in enumerate(visual) if s.id == cmd.scene_id), None)
         if idx is None:
             raise NotFoundError(f"Scene {cmd.scene_id} not found")
-        visual[idx].start_ms = max(0, cmd.start_ms)
-        visual[idx].end_ms = max(cmd.start_ms + 500, cmd.end_ms)
+        prev = visual[idx]
+        prev_source_start = prev.source_start_ms or 0
+        next_start = max(0, cmd.start_ms)
+        next_end = max(next_start + 500, cmd.end_ms)
+        next_source_start = (
+            max(0, cmd.source_start_ms)
+            if cmd.source_start_ms is not None
+            else max(0, prev_source_start + (next_start - prev.start_ms))
+        )
+        prev.start_ms = next_start
+        prev.end_ms = next_end
+        prev.source_start_ms = next_source_start
 
     elif cmd.type == "split_scene":
         idx = next((i for i, s in enumerate(visual) if s.id == cmd.scene_id), None)
@@ -42,10 +52,12 @@ def apply_command(doc: TimelineDocument, cmd: TimelineCommand) -> tuple[Timeline
             raise NotFoundError(f"Scene {cmd.scene_id} not found")
         orig = visual[idx]
         split_at = min(orig.end_ms - 500, max(orig.start_ms + 500, cmd.split_at_ms))
-        left = orig.model_copy(update={"end_ms": split_at})
+        base_source_start = orig.source_start_ms or 0
+        left = orig.model_copy(update={"end_ms": split_at, "source_start_ms": base_source_start})
         right = copy.deepcopy(orig)
         right.id = cmd.new_scene_id
         right.start_ms = split_at
+        right.source_start_ms = base_source_start + (split_at - orig.start_ms)
         visual[idx : idx + 1] = [left, right]
 
     elif cmd.type == "move_scene":
@@ -91,6 +103,7 @@ def apply_command(doc: TimelineDocument, cmd: TimelineCommand) -> tuple[Timeline
         if cmd.camera:
             s.camera = cmd.camera
         s.seed = cmd.seed if cmd.seed is not None else random.randint(1000, 999999)
+        s.source_start_ms = 0
         s.status = "generating_keyframe"
         est_cu = 0.08
 

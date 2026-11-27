@@ -204,3 +204,138 @@ def test_copilot_proposal_and_accept() -> None:
         )
         assert acc.status_code == 200
         assert acc.json()["revision"] == proj["current_revision"] + 1
+
+
+def test_split_trim_and_regenerate_source_start_ms() -> None:
+    with TestClient(app) as client:
+        proj = client.post(
+            "/v1/projects",
+            json={
+                "title": "Split Offset Test",
+                "topic": "Relativity",
+                "aspect": "16:9",
+                "target_res": "1080p",
+                "duration_preset": "reel_60s",
+                "qa_policy": "hotl_smart",
+                "brain_mode": "gemini_auto",
+            },
+        ).json()
+        pid = proj["id"]
+        scn1 = proj["timeline"]["tracks"]["visual"][0]
+        split_at = scn1["start_ms"] + 2500
+
+        r1 = client.post(
+            f"/v1/projects/{pid}/timeline/commands",
+            headers={"If-Match": "1"},
+            json={
+                "expected_revision": 1,
+                "author": "user",
+                "commands": [
+                    {
+                        "type": "split_scene",
+                        "scene_id": scn1["id"],
+                        "split_at_ms": split_at,
+                        "new_scene_id": "scn_split_b",
+                    }
+                ],
+            },
+        )
+        assert r1.status_code == 200
+        visual = r1.json()["tracks"]["visual"]
+        left = next(s for s in visual if s["id"] == scn1["id"])
+        right = next(s for s in visual if s["id"] == "scn_split_b")
+        assert left["source_start_ms"] == 0
+        assert right["source_start_ms"] == 2500
+
+        # Nested split on right half should cascade source_start_ms
+        r2 = client.post(
+            f"/v1/projects/{pid}/timeline/commands",
+            headers={"If-Match": "2"},
+            json={
+                "expected_revision": 2,
+                "author": "user",
+                "commands": [
+                    {
+                        "type": "split_scene",
+                        "scene_id": "scn_split_b",
+                        "split_at_ms": right["start_ms"] + 1500,
+                        "new_scene_id": "scn_split_c",
+                    }
+                ],
+            },
+        )
+        assert r2.status_code == 200
+        part_c = next(s for s in r2.json()["tracks"]["visual"] if s["id"] == "scn_split_c")
+        assert part_c["source_start_ms"] == 4000
+
+        # Trim start edge of part_c forward by 500ms -> source_start_ms advances to 4500ms
+        r3 = client.post(
+            f"/v1/projects/{pid}/timeline/commands",
+            headers={"If-Match": "3"},
+            json={
+                "expected_revision": 3,
+                "author": "user",
+                "commands": [
+                    {
+                        "type": "trim_scene",
+                        "scene_id": "scn_split_c",
+                        "start_ms": part_c["start_ms"] + 500,
+                        "end_ms": part_c["end_ms"],
+                    }
+                ],
+            },
+        )
+        assert r3.status_code == 200
+        trimmed_c = next(s for s in r3.json()["tracks"]["visual"] if s["id"] == "scn_split_c")
+        assert trimmed_c["source_start_ms"] == 4500
+
+        # Regenerating resets source_start_ms back to 0
+        r4 = client.post(
+            f"/v1/projects/{pid}/scenes/scn_split_c/regenerate",
+            headers={"If-Match": "4"},
+            json={"prompt": "Fresh clip"},
+        )
+        assert r4.status_code == 200
+        tl = client.get(f"/v1/projects/{pid}/timeline").json()
+        regen_c = next(s for s in tl["tracks"]["visual"] if s["id"] == "scn_split_c")
+        assert regen_c["source_start_ms"] == 0
+
+
+def test_regenerate_scene_enforces_if_match() -> None:
+    with TestClient(app) as client:
+        proj = client.post(
+            "/v1/projects",
+            json={
+                "title": "Regenerate Concurrency Test",
+                "topic": "Thermodynamics",
+                "aspect": "16:9",
+                "target_res": "1080p",
+                "duration_preset": "reel_60s",
+                "qa_policy": "hotl_smart",
+                "brain_mode": "gemini_auto",
+            },
+        ).json()
+        pid = proj["id"]
+        sid = proj["timeline"]["tracks"]["visual"][0]["id"]
+
+        bad = client.post(
+            f"/v1/projects/{pid}/scenes/{sid}/regenerate",
+            headers={"If-Match": "abc"},
+            json={"prompt": "Malformed header"},
+        )
+        assert bad.status_code == 422
+
+        ok = client.post(
+            f"/v1/projects/{pid}/scenes/{sid}/regenerate",
+            headers={"If-Match": "1"},
+            json={"prompt": "Updated scene prompt"},
+        )
+        assert ok.status_code == 200
+        assert ok.json()["revision"] == 2
+
+        stale = client.post(
+            f"/v1/projects/{pid}/scenes/{sid}/regenerate",
+            headers={"If-Match": "1"},
+            json={"prompt": "Stale request"},
+        )
+        assert stale.status_code == 409

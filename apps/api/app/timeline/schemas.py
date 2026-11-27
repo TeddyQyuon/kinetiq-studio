@@ -61,6 +61,7 @@ class VisualSceneItem(BaseModel):
     id: str
     start_ms: int = Field(ge=0)
     end_ms: int = Field(gt=0)
+    source_start_ms: int = Field(default=0, ge=0)
     kind: Literal["ai_video", "diagram", "image_motion"]
     narration: str
     prompt: ScenePromptBundle | None = None
@@ -146,6 +147,7 @@ class TrimSceneCmd(BaseModel):
     scene_id: str
     start_ms: int
     end_ms: int
+    source_start_ms: int | None = Field(default=None, ge=0)
 
 
 class SplitSceneCmd(BaseModel):

@@ -15,6 +15,7 @@ export type TimelineCommand =
       scene_id: string;
       start_ms: number;
       end_ms: number;
+      source_start_ms?: number;
     }
   | {
       type: "split_scene";
@@ -130,16 +131,25 @@ export function applyTimelineCommand(doc: TimelineDocument, cmd: TimelineCommand
       const idx = next.tracks.visual.findIndex((s) => s.id === cmd.scene_id);
       if (idx === -1) throw new Error(`Scene not found: ${cmd.scene_id}`);
       const prev = next.tracks.visual[idx];
+      const prevSourceStart = prev.source_start_ms ?? 0;
+      const nextStart = Math.max(0, cmd.start_ms);
+      const nextEnd = Math.max(nextStart + 500, cmd.end_ms);
+      const nextSourceStart =
+        cmd.source_start_ms !== undefined
+          ? Math.max(0, cmd.source_start_ms)
+          : Math.max(0, prevSourceStart + (nextStart - prev.start_ms));
       inverse = {
         type: "trim_scene",
         scene_id: cmd.scene_id,
         start_ms: prev.start_ms,
         end_ms: prev.end_ms,
+        source_start_ms: prevSourceStart,
       };
       next.tracks.visual[idx] = {
         ...prev,
-        start_ms: Math.max(0, cmd.start_ms),
-        end_ms: Math.max(cmd.start_ms + 500, cmd.end_ms),
+        start_ms: nextStart,
+        end_ms: nextEnd,
+        source_start_ms: nextSourceStart,
       };
       break;
     }
@@ -149,12 +159,18 @@ export function applyTimelineCommand(doc: TimelineDocument, cmd: TimelineCommand
       if (idx === -1) throw new Error(`Scene not found: ${cmd.scene_id}`);
       const orig = next.tracks.visual[idx];
       const splitAt = Math.min(orig.end_ms - 500, Math.max(orig.start_ms + 500, cmd.split_at_ms));
-      const left: VisualSceneItem = { ...orig, end_ms: splitAt };
+      const baseSourceStart = orig.source_start_ms ?? 0;
+      const left: VisualSceneItem = {
+        ...orig,
+        end_ms: splitAt,
+        source_start_ms: baseSourceStart,
+      };
       const right: VisualSceneItem = {
         ...JSON.parse(JSON.stringify(orig)),
         id: cmd.new_scene_id,
         start_ms: splitAt,
         end_ms: orig.end_ms,
+        source_start_ms: baseSourceStart + (splitAt - orig.start_ms),
       };
       next.tracks.visual.splice(idx, 1, left, right);
       inverse = { type: "delete_scene", scene_id: cmd.new_scene_id };
@@ -233,6 +249,7 @@ export function applyTimelineCommand(doc: TimelineDocument, cmd: TimelineCommand
         model: cmd.model ?? prev.model ?? "ltx25_fp8",
         camera: cmd.camera ?? prev.camera ?? "slow_dolly_in",
         seed: cmd.seed ?? prev.seed ?? Math.floor(Math.random() * 1000000),
+        source_start_ms: 0,
         status: "generating_keyframe",
       };
       requiresGpu = true;

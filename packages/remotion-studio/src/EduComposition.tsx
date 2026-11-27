@@ -530,7 +530,7 @@ const VisualSceneLayer: React.FC<{
   mediaUrls: Record<string, string>;
 }> = ({ scene, palette, mediaUrls }) => {
   const frame = useCurrentFrame();
-  const { durationInFrames } = useVideoConfig();
+  const { durationInFrames, fps } = useVideoConfig();
 
   if (scene.kind === "diagram") {
     return (
@@ -549,9 +549,10 @@ const VisualSceneLayer: React.FC<{
   const kfUrl = kfId ? mediaUrls[kfId] : undefined;
 
   if (videoUrl && !videoUrl.startsWith("mock://")) {
+    const startFrom = Math.max(0, Math.round(((scene.source_start_ms ?? 0) / 1000) * fps));
     return (
       <AbsoluteFill style={{ backgroundColor: "#000" }}>
-        <Video src={videoUrl} style={{ width: "100%", height: "100%", objectFit: "cover" }} />
+        <Video src={videoUrl} startFrom={startFrom} style={{ width: "100%", height: "100%", objectFit: "cover" }} />
       </AbsoluteFill>
     );
   }

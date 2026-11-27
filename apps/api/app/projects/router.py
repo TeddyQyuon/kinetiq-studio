@@ -2,11 +2,11 @@ from __future__ import annotations
 
 import uuid
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, Header
 from sqlalchemy.orm import Session
 
 from app.core.db import get_db
-from app.core.errors import NotFoundError
+from app.core.errors import NotFoundError, ValidationFailedError
 from app.director.schemas import (
     ChatGPTImportRequest,
     CopilotAcceptRequest,
@@ -195,15 +195,37 @@ def approve_scene(project_id: str, scene_id: str, db: Session = Depends(get_db))
     return approve_scene_and_dispatch(db, proj, scene_id)
 
 
+def _parse_if_match(if_match: str | None) -> int | None:
+    if if_match is None:
+        return None
+    cleaned = if_match.strip()
+    if cleaned.startswith("W/"):
+        cleaned = cleaned[2:].strip()
+    cleaned = cleaned.strip('"').strip("'")
+    if not cleaned:
+        return None
+    if not cleaned.isdigit():
+        raise ValidationFailedError("If-Match header must be a numeric timeline revision")
+    return int(cleaned)
+
+
 @router.post("/{project_id}/scenes/{scene_id}/regenerate")
 def regenerate_scene(
     project_id: str,
     scene_id: str,
     body: SceneRegenerateRequest,
+    if_match: str | None = Header(default=None, alias="If-Match"),
     db: Session = Depends(get_db),
 ) -> dict:
     from pydantic import TypeAdapter
+
     proj = _get_project(db, project_id)
+    parsed_if_match = _parse_if_match(if_match)
+    expected = (
+        parsed_if_match
+        if parsed_if_match is not None
+        else (body.expected_revision if body.expected_revision is not None else proj.current_revision)
+    )
     cmd = TypeAdapter(TimelineCommand).validate_python(
         {
             "type": "regenerate_clip",
@@ -214,7 +236,7 @@ def regenerate_scene(
             "seed": body.seed,
         }
     )
-    doc = apply_timeline_commands(db, proj.id, proj.current_revision, [cmd], author="user")
+    doc = apply_timeline_commands(db, proj.id, expected, [cmd], author="user")
     scene = next((s for s in doc.tracks.visual if s.id == scene_id), None)
     job = enqueue_job(
         db,
