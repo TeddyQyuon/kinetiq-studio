@@ -194,8 +194,17 @@ function parseHttpsUrl(errors, env, key) {
   if (parsed.protocol !== "https:") {
     errors.push(`${key} must use https:// in Phase 1 VPS mode.`);
   }
+  if (parsed.username || parsed.password) {
+    errors.push(`${key} must not contain embedded credentials.`);
+  }
   if (parsed.pathname && parsed.pathname !== "/") {
     errors.push(`${key} must not include a sub-path (expected origin root only).`);
+  }
+  if (parsed.search || parsed.hash) {
+    errors.push(`${key} must not include query strings or URL fragments.`);
+  }
+  if (parsed.port) {
+    errors.push(`${key} must use the standard HTTPS port (no explicit port).`);
   }
   return parsed;
 }

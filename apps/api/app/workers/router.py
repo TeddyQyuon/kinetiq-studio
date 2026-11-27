@@ -245,12 +245,15 @@ async def create_upload_session(
 
     user = ensure_default_owner(db)
     provider = get_storage_provider(db)
-    folder_id = project.drive_folder_id
-    if not folder_id:
-        slug = "".join(c if c.isalnum() else "-" for c in project.title.lower()).strip("-")[:32] or "project"
+    slug = "".join(c if c.isalnum() else "-" for c in project.title.lower()).strip("-")[:32] or "project"
+    if provider.name == "drive":
+        folder_id = project.drive_folder_id
+        if not folder_id:
+            folder_id = await provider.ensure_project_space(project.id, slug, user.id)
+            project.drive_folder_id = folder_id
+            db.commit()
+    else:
         folder_id = await provider.ensure_project_space(project.id, slug, user.id)
-        project.drive_folder_id = folder_id
-        db.commit()
 
     storage_key = _upload_prefix(job, body.asset_kind) + body.filename
 
@@ -337,9 +340,8 @@ async def complete_job(
             storage_key=art.storage_key,
             drive_file_id=art.drive_file_id,
             expected_size=art.size_bytes,
+            expected_sha256=art.sha256,
         )
-        if art.sha256 and verified.sha256 and art.sha256 != verified.sha256:
-            raise ValidationFailedError("Stored file checksum does not match upload")
         files.append((art, verified))
 
     # Verify uploads before taking the write lock. All asset,
@@ -357,7 +359,7 @@ async def complete_job(
             storage_key=verified.storage_key,
             drive_file_id=verified.drive_file_id,
             content_type=art.content_type,
-            sha256=art.sha256 or verified.sha256,
+            sha256=verified.sha256 or art.sha256,
             size_bytes=verified.size_bytes,
             width=art.width,
             height=art.height,

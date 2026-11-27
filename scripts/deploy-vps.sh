@@ -151,7 +151,17 @@ grep -Fq '{$STUDIO_DOMAIN}' "$CADDYFILE" || fail "infra/Caddyfile must reference
 grep -Fq '{$API_DOMAIN}' "$CADDYFILE" || fail "infra/Caddyfile must reference {\$API_DOMAIN}"
 
 compose() {
-  docker compose \
+  local -a env_args=(
+    "PATH=${PATH}"
+    "HOME=${HOME:-/root}"
+  )
+  local var
+  for var in DOCKER_HOST DOCKER_CONTEXT DOCKER_CONFIG DOCKER_TLS_VERIFY DOCKER_CERT_PATH DOCKER_API_VERSION COMPOSE_PROJECT_NAME TMPDIR XDG_RUNTIME_DIR; do
+    if [ -n "${!var:-}" ]; then
+      env_args+=("${var}=${!var}")
+    fi
+  done
+  env -i "${env_args[@]}" docker compose \
     --env-file "$ENV_FILE" \
     -f "${REPO_ROOT}/docker-compose.yml" \
     -f "${REPO_ROOT}/infra/docker-compose.vps.yml" \
@@ -235,6 +245,9 @@ wait_until() {
 
 wait_until "PostgreSQL" compose exec -T postgres pg_isready -U postgres
 wait_until "Redis" compose exec -T redis redis-cli ping
+
+log "Stopping existing api and orchestrator containers before migrations..."
+compose stop api orchestrator
 
 log "Running Alembic database migrations (alembic upgrade head)..."
 if ! compose run --rm --no-deps api alembic upgrade head; then
