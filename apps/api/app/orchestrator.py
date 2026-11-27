@@ -11,6 +11,7 @@ from app.core.db import SessionLocal, init_db
 from app.core.logging import configure_logging
 from app.events.service import emit_event
 from app.models import Job, Project, Scene, Worker
+from app.storage.reconcile import reconcile_vault
 
 logger = logging.getLogger("kinetiq.orchestrator")
 
@@ -76,7 +77,23 @@ def run_orchestrator_tick(db: Session) -> dict[str, int]:
     }
 
 
+async def _reconciliation_loop() -> None:
+    while True:
+        try:
+            with SessionLocal() as db:
+                await reconcile_vault(db)
+        except Exception:
+            logger.exception("Vault reconciliation failed")
+        await asyncio.sleep(get_settings().vault_reconcile_interval_seconds)
+
+
 async def orchestrator_loop(interval_seconds: int = 30) -> None:
+    async with asyncio.TaskGroup() as tasks:
+        tasks.create_task(_reconciliation_loop())
+        tasks.create_task(_lease_loop(interval_seconds))
+
+
+async def _lease_loop(interval_seconds: int) -> None:
     logger.info("Orchestrator loop started (interval=%ss)", interval_seconds)
     while True:
         try:

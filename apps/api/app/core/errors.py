@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from fastapi import FastAPI, Request
+from fastapi import Depends, FastAPI, Request
 from fastapi.responses import JSONResponse
 
 
@@ -40,6 +40,11 @@ class QuotaConfirmationRequiredError(AppError):
 
 
 def register_error_handlers(app: FastAPI) -> None:
+    from app.identity.access import require_access
+
+    # Install the API-wide dependency before the feature routers are included.
+    app.router.dependencies.append(Depends(require_access))
+
     @app.exception_handler(AppError)
     async def _handle_app_error(_req: Request, exc: AppError) -> JSONResponse:
         return JSONResponse(
