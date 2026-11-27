@@ -54,6 +54,14 @@ interface TrimDragState {
   msPerPx: number;
 }
 
+type QueuedServerOp =
+  | { kind: "commands"; commands: TimelineCommand[] }
+  | {
+      kind: "regenerate";
+      sceneId: string;
+      patch: { prompt?: string; model?: ModelChoice; camera?: CameraPreset };
+    };
+
 function formatTimeMs(ms: number): string {
   const clamped = Math.max(0, ms);
   const totalSec = clamped / 1000;
@@ -100,11 +108,14 @@ export default function VideoEditorPage() {
     sceneProgress,
     hydrateWithAutosave,
     selectScene,
+    dispatchLocalCommand,
     dispatchLocalBatch,
     setPendingProposal,
     acceptPendingProposalLocal,
     undo,
     redo,
+    advanceServerRevision,
+    reconcileServerSnapshot,
     markSyncedFromServer,
     setSyncState,
     discardLocalDraft,
@@ -130,10 +141,13 @@ export default function VideoEditorPage() {
   const visualTrackRef = useRef<HTMLDivElement>(null);
   const rulerRef = useRef<HTMLDivElement>(null);
   const scrubbingRulerRef = useRef(false);
+  const pendingOpsRef = useRef<QueuedServerOp[]>([]);
+  const drainingOpsRef = useRef(false);
 
   // Initial load with crash-safe IndexedDB draft restoration
   useEffect(() => {
     let active = true;
+    pendingOpsRef.current = [];
     api.getProject(projectId).then((res) => {
       if (!active) return;
       setServerBaseDoc(res.data.timeline);
@@ -144,6 +158,7 @@ export default function VideoEditorPage() {
     });
     return () => {
       active = false;
+      pendingOpsRef.current = [];
     };
   }, [projectId, hydrateWithAutosave]);
 
@@ -166,14 +181,17 @@ export default function VideoEditorPage() {
   const handleLiveEvent = useCallback(
     (event: StudioEvent) => {
       applyLiveEvent(event);
-      if (event.event_type === "asset.synced" && !isDemo) {
+      if ((event.event_type === "asset.synced" || event.event_type === "timeline.updated") && !isDemo) {
         void api.getProject(projectId).then((res) => {
           setServerBaseDoc(res.data.timeline);
           mergeMediaUrls(res.data.media_urls);
+          if (!drainingOpsRef.current && pendingOpsRef.current.length === 0) {
+            reconcileServerSnapshot(res.data.timeline);
+          }
         });
       }
     },
-    [applyLiveEvent, isDemo, mergeMediaUrls, projectId],
+    [applyLiveEvent, isDemo, mergeMediaUrls, projectId, reconcileServerSnapshot],
   );
 
   const { status: sseStatus, lastEventId, reconnectNow } = useProjectEvents({
@@ -244,72 +262,96 @@ export default function VideoEditorPage() {
     [durationInFrames, fps, totalMs],
   );
 
-  // Unified local + IndexedDB + optional backend command commit
+  const drainWriteQueue = useCallback(async () => {
+    if (drainingOpsRef.current || isDemo) return;
+    drainingOpsRef.current = true;
+    try {
+      while (pendingOpsRef.current.length > 0) {
+        const op = pendingOpsRef.current[0];
+        const expectedRev = useEditorStore.getState().serverRevision;
+        setSyncState("syncing", null);
+        try {
+          if (op.kind === "commands") {
+            const updated = await api.applyCommands(projectId, expectedRev, op.commands);
+            pendingOpsRef.current.shift();
+            setServerBaseDoc(updated);
+            if (pendingOpsRef.current.length === 0) {
+              markSyncedFromServer(updated);
+            } else {
+              advanceServerRevision(updated.revision);
+            }
+          } else {
+            await api.regenerateScene(projectId, op.sceneId, op.patch);
+            const fresh = await api.getProject(projectId);
+            pendingOpsRef.current.shift();
+            setServerBaseDoc(fresh.data.timeline);
+            mergeMediaUrls(fresh.data.media_urls);
+            if (pendingOpsRef.current.length === 0) {
+              markSyncedFromServer(fresh.data.timeline);
+            } else {
+              advanceServerRevision(fresh.data.timeline.revision);
+            }
+          }
+        } catch (err) {
+          if (err instanceof ApiError && err.status === 409) {
+            setSyncState(
+              "conflict",
+              "Server revision changed (409 Conflict). Sync draft or reload server.",
+            );
+          } else {
+            setSyncState(
+              "offline",
+              err instanceof Error ? err.message : "Saved locally; server sync pending.",
+            );
+          }
+          break;
+        }
+      }
+    } finally {
+      drainingOpsRef.current = false;
+    }
+  }, [advanceServerRevision, isDemo, markSyncedFromServer, mergeMediaUrls, projectId, setSyncState]);
+
+  // Unified local + IndexedDB + serialized backend command commit
   const commitTimelineCommands = useCallback(
     async (commands: TimelineCommand[], label?: string) => {
       if (!document || commands.length === 0) return;
-      const revForServer = serverRevision;
       dispatchLocalBatch(commands, label);
-
       if (isDemo) return;
-
-      setSyncState("syncing", null);
-      try {
-        const updated = await api.applyCommands(projectId, revForServer, commands);
-        setServerBaseDoc(updated);
-        markSyncedFromServer(updated);
-      } catch (err) {
-        if (err instanceof ApiError && err.status === 409) {
-          setSyncState(
-            "conflict",
-            "Server revision changed (409 Conflict). Sync draft or reload server.",
-          );
-        } else {
-          setSyncState(
-            "offline",
-            err instanceof Error ? err.message : "Saved locally; server sync pending.",
-          );
-        }
-      }
+      pendingOpsRef.current.push({ kind: "commands", commands });
+      await drainWriteQueue();
     },
-    [dispatchLocalBatch, document, isDemo, markSyncedFromServer, projectId, serverRevision, setSyncState],
+    [dispatchLocalBatch, document, drainWriteQueue, isDemo],
+  );
+
+  const triggerSceneRegeneration = useCallback(
+    async (
+      sceneId: string,
+      patch: { prompt?: string; model?: ModelChoice; camera?: CameraPreset },
+      label?: string,
+    ) => {
+      if (!document) return;
+      dispatchLocalCommand({ type: "regenerate_clip", scene_id: sceneId, ...patch }, label);
+      if (isDemo) return;
+      pendingOpsRef.current.push({ kind: "regenerate", sceneId, patch });
+      await drainWriteQueue();
+    },
+    [dispatchLocalCommand, document, drainWriteQueue, isDemo],
   );
 
   const handleUndo = useCallback(async () => {
-    const revForServer = serverRevision;
     const cmds = undo();
     if (!cmds || isDemo) return;
-    setSyncState("syncing", null);
-    try {
-      const updated = await api.applyCommands(projectId, revForServer, cmds);
-      setServerBaseDoc(updated);
-      markSyncedFromServer(updated);
-    } catch (err) {
-      if (err instanceof ApiError && err.status === 409) {
-        setSyncState("conflict", "409 Conflict during Undo sync.");
-      } else {
-        setSyncState("offline", "Undo saved offline in IndexedDB.");
-      }
-    }
-  }, [isDemo, markSyncedFromServer, projectId, serverRevision, setSyncState, undo]);
+    pendingOpsRef.current.push({ kind: "commands", commands: cmds });
+    await drainWriteQueue();
+  }, [drainWriteQueue, isDemo, undo]);
 
   const handleRedo = useCallback(async () => {
-    const revForServer = serverRevision;
     const cmds = redo();
     if (!cmds || isDemo) return;
-    setSyncState("syncing", null);
-    try {
-      const updated = await api.applyCommands(projectId, revForServer, cmds);
-      setServerBaseDoc(updated);
-      markSyncedFromServer(updated);
-    } catch (err) {
-      if (err instanceof ApiError && err.status === 409) {
-        setSyncState("conflict", "409 Conflict during Redo sync.");
-      } else {
-        setSyncState("offline", "Redo saved offline in IndexedDB.");
-      }
-    }
-  }, [isDemo, markSyncedFromServer, projectId, redo, serverRevision, setSyncState]);
+    pendingOpsRef.current.push({ kind: "commands", commands: cmds });
+    await drainWriteQueue();
+  }, [drainWriteQueue, isDemo, redo]);
 
   const activeSceneAtPlayhead = useMemo(() => {
     if (!document) return null;
@@ -471,15 +513,18 @@ export default function VideoEditorPage() {
 
   async function handleSaveSceneInspector() {
     if (!document || !selectedScene) return;
-    const cmds: TimelineCommand[] = [];
     if (narrationDraft !== selectedScene.narration) {
-      cmds.push({ type: "edit_narration", scene_id: selectedScene.id, narration: narrationDraft });
+      await commitTimelineCommands(
+        [{ type: "edit_narration", scene_id: selectedScene.id, narration: narrationDraft }],
+        `Edit ${selectedScene.id}`,
+      );
     }
     if (promptDraft && promptDraft !== (selectedScene.prompt?.ltx25 ?? "")) {
-      cmds.push({ type: "regenerate_clip", scene_id: selectedScene.id, prompt: promptDraft });
-    }
-    if (cmds.length > 0) {
-      await commitTimelineCommands(cmds, `Edit ${selectedScene.id}`);
+      await triggerSceneRegeneration(
+        selectedScene.id,
+        { prompt: promptDraft },
+        `Prompt ${selectedScene.id}`,
+      );
     }
   }
 
@@ -515,17 +560,38 @@ export default function VideoEditorPage() {
   async function handleSyncDraftToServer() {
     if (!document || isDemo) return;
     setSyncState("syncing", null);
+    if (pendingOpsRef.current.length > 0) {
+      try {
+        const latest = await api.getProject(projectId);
+        setServerBaseDoc(latest.data.timeline);
+        mergeMediaUrls(latest.data.media_urls);
+        advanceServerRevision(latest.data.timeline.revision);
+        await drainWriteQueue();
+      } catch (err) {
+        setSyncState("conflict", err instanceof Error ? err.message : "Failed to sync draft");
+      }
+      return;
+    }
+
+    const baseRev = useEditorStore.getState().serverRevision;
     try {
-      const latest = await api.getProject(projectId);
-      const updated = await api.putTimeline(projectId, latest.data.timeline.revision, document);
+      const updated = await api.putTimeline(projectId, baseRev, document);
       setServerBaseDoc(updated);
       markSyncedFromServer(updated);
     } catch (err) {
-      setSyncState("conflict", err instanceof Error ? err.message : "Failed to sync draft");
+      if (err instanceof ApiError && err.status === 409) {
+        setSyncState(
+          "conflict",
+          `Server has moved past draft base rev ${baseRev}. Click Reload Server to avoid overwriting newer changes.`,
+        );
+      } else {
+        setSyncState("conflict", err instanceof Error ? err.message : "Failed to sync draft");
+      }
     }
   }
 
   async function handleDiscardDraft() {
+    pendingOpsRef.current = [];
     if (!isDemo) {
       const fresh = await api.getProject(projectId);
       setServerBaseDoc(fresh.data.timeline);
@@ -876,14 +942,9 @@ export default function VideoEditorPage() {
                     <select
                       value={selectedScene.model ?? "ltx25_fp8"}
                       onChange={(e) =>
-                        void commitTimelineCommands(
-                          [
-                            {
-                              type: "regenerate_clip",
-                              scene_id: selectedScene.id,
-                              model: e.target.value as ModelChoice,
-                            },
-                          ],
+                        void triggerSceneRegeneration(
+                          selectedScene.id,
+                          { model: e.target.value as ModelChoice },
                           `Model ${e.target.value}`,
                         )
                       }
@@ -896,14 +957,9 @@ export default function VideoEditorPage() {
                     <select
                       value={selectedScene.camera ?? "slow_dolly_in"}
                       onChange={(e) =>
-                        void commitTimelineCommands(
-                          [
-                            {
-                              type: "regenerate_clip",
-                              scene_id: selectedScene.id,
-                              camera: e.target.value as CameraPreset,
-                            },
-                          ],
+                        void triggerSceneRegeneration(
+                          selectedScene.id,
+                          { camera: e.target.value as CameraPreset },
                           `Camera ${e.target.value}`,
                         )
                       }

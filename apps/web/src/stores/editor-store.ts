@@ -71,6 +71,17 @@ function buildExactInverse(
     }
   }
 
+  const convertedIds = new Set(
+    commands.filter((c) => c.type === "convert_scene_to_diagram").map((c) => c.scene_id),
+  );
+  if (convertedIds.size > 0) {
+    return fallbackInverses.flatMap((inv): TimelineCommand[] =>
+      inv.type === "restore_scene" && convertedIds.has(inv.scene.id)
+        ? [{ type: "delete_scene", scene_id: inv.scene.id }, inv]
+        : [inv],
+    );
+  }
+
   return fallbackInverses;
 }
 
@@ -112,6 +123,8 @@ interface EditorState {
   acceptPendingProposalLocal: () => TimelineDocument | null;
   undo: () => TimelineCommand[] | null;
   redo: () => TimelineCommand[] | null;
+  advanceServerRevision: (revision: number) => void;
+  reconcileServerSnapshot: (serverDoc: TimelineDocument) => void;
   markSyncedFromServer: (serverDoc: TimelineDocument) => void;
   setSyncState: (syncStatus: ServerSyncStatus, syncError?: string | null) => void;
   discardLocalDraft: (freshServerDoc: TimelineDocument) => Promise<void>;
@@ -266,7 +279,7 @@ export const useEditorStore = create<EditorState>((set, get) => ({
         set({
           projectId,
           document: draft.document,
-          serverRevision: serverDoc.revision,
+          serverRevision: draft.serverRevision,
           mediaUrls,
           opfsCachedAssets: switchingProject ? {} : get().opfsCachedAssets,
           selectedSceneId: resolveSelectedScene(draft.document, draft.selectedSceneId),
@@ -377,6 +390,35 @@ export const useEditorStore = create<EditorState>((set, get) => ({
 
     persistCurrentDraft(get, set);
     return entry.forward;
+  },
+
+  advanceServerRevision: (revision) => {
+    set((state) => ({
+      serverRevision: Math.max(state.serverRevision, revision),
+    }));
+    persistCurrentDraft(get, set);
+  },
+
+  reconcileServerSnapshot: (serverDoc) => {
+    const state = get();
+    if (serverDoc.revision < state.serverRevision) return;
+    if (!state.dirty) {
+      set({
+        document: serverDoc,
+        serverRevision: serverDoc.revision,
+        selectedSceneId: resolveSelectedScene(serverDoc, state.selectedSceneId),
+        syncStatus: "synced",
+        syncError: null,
+      });
+      persistCurrentDraft(get, set);
+      return;
+    }
+    if (serverDoc.revision > state.serverRevision) {
+      set({
+        syncStatus: "conflict",
+        syncError: `Server updated to rev ${serverDoc.revision}; local draft is based on rev ${state.serverRevision}.`,
+      });
+    }
   },
 
   markSyncedFromServer: (serverDoc) => {

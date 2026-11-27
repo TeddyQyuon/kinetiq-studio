@@ -254,11 +254,16 @@ export const api = {
     projectId: string,
     sceneId: string,
     body: { prompt?: string; model?: string; camera?: string },
-  ): Promise<void> {
-    await requestJson(`/v1/projects/${projectId}/scenes/${sceneId}/regenerate`, {
-      method: "POST",
-      body: JSON.stringify(body),
-    });
+  ): Promise<{ ok: boolean; revision: number; queued_job_id: string }> {
+    return (
+      await requestJson<{ ok: boolean; revision: number; queued_job_id: string }>(
+        `/v1/projects/${projectId}/scenes/${sceneId}/regenerate`,
+        {
+          method: "POST",
+          body: JSON.stringify(body),
+        },
+      )
+    ).data;
   },
 
   async applyCommands(
