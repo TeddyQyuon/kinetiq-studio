@@ -45,6 +45,15 @@ jobs:
       - name: Next.js production build
         run: npm run build
 
+      - name: Validate VPS preflight and deploy scripts
+        run: |
+          node --check scripts/check-env.mjs
+          bash -n scripts/deploy-vps.sh
+          if node scripts/check-env.mjs --file .env.example; then
+            echo "Expected .env.example to fail production preflight"
+            exit 1
+          fi
+
   api-and-workers:
     runs-on: ubuntu-latest
     steps:
