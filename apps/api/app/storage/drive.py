@@ -35,11 +35,22 @@ class VerifiedFile:
 
 
 class StorageProvider:
-    async def verify_uploaded_file(self, *, user_id, storage_key, drive_file_id, expected_size):
+    async def verify_uploaded_file(
+        self,
+        *,
+        user_id,
+        storage_key,
+        drive_file_id,
+        expected_size,
+        expected_sha256: str | None = None,
+    ):
         meta = await self.metadata(user_id, storage_key, drive_file_id, checksum=True)
         if int(meta["size"]) != expected_size:
             raise ValidationFailedError("Stored file size does not match upload")
-        return VerifiedFile(storage_key, drive_file_id, expected_size, meta.get("sha256Checksum"))
+        actual_sha256 = meta.get("sha256Checksum")
+        if expected_sha256 and actual_sha256 and expected_sha256.lower() != actual_sha256.lower():
+            raise ValidationFailedError("Stored file checksum does not match upload")
+        return VerifiedFile(storage_key, drive_file_id, expected_size, actual_sha256)
 
 
 class LocalVaultProvider(StorageProvider):
