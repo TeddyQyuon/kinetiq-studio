@@ -218,6 +218,13 @@ def _parse_if_match(if_match: str | None) -> int | None:
     return int(cleaned)
 
 
+def _require_if_match(if_match: str | None) -> int:
+    parsed = _parse_if_match(if_match)
+    if parsed is None:
+        raise ValidationFailedError("If-Match header with expected timeline revision is required")
+    return parsed
+
+
 @router.post("/{project_id}/scenes/{scene_id}/revoice")
 def revoice_scene(
     project_id: str,
@@ -226,7 +233,7 @@ def revoice_scene(
     db: Session = Depends(get_db),
 ) -> dict:
     project = _get_project(db, project_id)
-    check_project_revision(project, _parse_if_match(if_match))
+    check_project_revision(project, _require_if_match(if_match))
     return enqueue_scene_revoice(db, project, scene_id)
 
 
@@ -246,7 +253,7 @@ async def set_project_music(
     db: Session = Depends(get_db),
 ) -> MusicUploadResponse:
     project = _get_project(db, project_id)
-    revision = check_project_revision(project, _parse_if_match(if_match))
+    revision = check_project_revision(project, _require_if_match(if_match))
     return await attach_music(db, project, await read_music(request), revision)
 
 
@@ -257,7 +264,7 @@ def remove_project_music(
     db: Session = Depends(get_db),
 ) -> TimelineDocument:
     project = _get_project(db, project_id)
-    revision = check_project_revision(project, _parse_if_match(if_match))
+    revision = check_project_revision(project, _require_if_match(if_match))
     return detach_music(db, project, revision)
 
 

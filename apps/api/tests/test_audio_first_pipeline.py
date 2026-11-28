@@ -99,6 +99,11 @@ def test_generation_and_export_share_immutable_speech_dependencies(project, e2e_
             assert align.depends_on == [tts.id]
 
 
+def _if_match(api, project) -> dict[str, str]:
+    rev = api.get(project + "/timeline").json()["revision"]
+    return {"If-Match": str(rev)}
+
+
 def test_out_of_order_speech_reflows_live_timeline_and_preserves_frozen_export(project, e2e_studio):
     from app.models import Job
 
@@ -108,12 +113,12 @@ def test_out_of_order_speech_reflows_live_timeline_and_preserves_frozen_export(p
     api.put(project + "/timeline", json={"expected_revision": doc["revision"], "document": doc}).raise_for_status()
 
     worker = media_worker(api)
-    later = api.post(project + "/scenes/example/revoice").json()
+    later = api.post(project + "/scenes/example/revoice", headers=_if_match(api, project)).json()
     assert complete_audio(api, worker, 3000)["id"] == later["tts_job_id"]
     assert complete_words(api, worker, "Second")["id"] == later["align_job_id"]
     assert api.get(project + "/timeline").json()["tracks"]["captions"]["words"][0]["start_ms"] == 4100
 
-    earlier = api.post(project + "/scenes/opening/revoice").json()
+    earlier = api.post(project + "/scenes/opening/revoice", headers=_if_match(api, project)).json()
     assert api.post(project + "/generate").json()["job_ids"] == [earlier["tts_job_id"], earlier["align_job_id"]]
     frozen = api.post(project + "/exports", json={"resolution": "1080p"}).json()
     complete_audio(api, worker, 1000)
@@ -150,15 +155,15 @@ def test_out_of_order_speech_reflows_live_timeline_and_preserves_frozen_export(p
     api.post(project + "/exports", json={"resolution": "1080p"}).raise_for_status()
     with e2e_studio.sessions() as db:
         assert db.query(Job).filter_by(job_type="render").order_by(Job.created_at.desc()).first().depends_on == []
-    new_take = api.post(project + "/scenes/example/revoice").json()
+    new_take = api.post(project + "/scenes/example/revoice", headers=_if_match(api, project)).json()
     assert new_take["ok"] and new_take["tts_job_id"] != later["tts_job_id"]
-    assert api.post(project + "/scenes/example/revoice").json() == new_take
+    assert api.post(project + "/scenes/example/revoice", headers=_if_match(api, project)).json() == new_take
 
 
 def test_commands_and_accepted_copilot_dispatch_once(project, e2e_studio):
     api = e2e_studio.client
     worker = media_worker(api)
-    api.post(project + "/scenes/example/revoice").raise_for_status()
+    api.post(project + "/scenes/example/revoice", headers=_if_match(api, project)).raise_for_status()
     complete_audio(api, worker, 3100)
     stale_align = claim(api, worker, "align")
     doc = api.get(project + "/timeline").json()
@@ -204,7 +209,7 @@ def test_invalid_alignment_rolls_back_then_valid_retry_succeeds(project, e2e_stu
     from app.models import Asset
 
     api = e2e_studio.client
-    api.post(project + "/scenes/example/revoice").raise_for_status()
+    api.post(project + "/scenes/example/revoice", headers=_if_match(api, project)).raise_for_status()
     worker = media_worker(api)
     complete_audio(api, worker, 3000)
     align = claim(api, worker, "align")
@@ -224,7 +229,11 @@ def test_music_preset_upload_and_delete(project, e2e_studio, preset):
     from app.models import Asset
 
     api = e2e_studio.client
-    result = api.post(project + "/music", json={"preset": preset, "volume": 0.18, "duck_db": -19})
+    result = api.post(
+        project + "/music",
+        headers=_if_match(api, project),
+        json={"preset": preset, "volume": 0.18, "duck_db": -19},
+    )
     assert result.is_success, result.text
     data = result.json()
     assert set(data) == {"asset_id", "media_url", "timeline"}
@@ -241,7 +250,7 @@ def test_music_preset_upload_and_delete(project, e2e_studio, preset):
         assert stored.sha256 == hashlib.sha256(audio).hexdigest()
         assert stored.storage_key == f"{stored.project_id}/music/{stored.id}.wav"
     assert api.delete(project + "/music", headers={"If-Match": "1"}).status_code == 409
-    removed = api.delete(project + "/music")
+    removed = api.delete(project + "/music", headers=_if_match(api, project))
     assert removed.json()["tracks"]["music"]["asset"] is None
     assert api.get(data["media_url"]).content == audio  # frozen exports retain the original upload
 
@@ -251,16 +260,25 @@ def test_uploaded_music_and_independent_project_duplicate(project, e2e_studio):
 
     api = e2e_studio.client
     data = _build_minimal_wav()
-    uploaded = api.post(project + "/music", files={"file": ("sample.wav", data, "audio/wav")},
-                        data={"volume": "0.42", "duck_db": "-12", "mood": "quiet"})
+    uploaded = api.post(
+        project + "/music",
+        headers=_if_match(api, project),
+        files={"file": ("sample.wav", data, "audio/wav")},
+        data={"volume": "0.42", "duck_db": "-12", "mood": "quiet"},
+    )
     assert uploaded.is_success, uploaded.text
     original = uploaded.json()
     assert api.get(original["media_url"]).content == data
     assert original["timeline"]["tracks"]["music"]["mood"] == "quiet"
-    assert api.post(project + "/music", files={"file": ("sample.exe", data, "audio/wav")}).status_code == 415
-    assert api.post(project + "/music", files={"file": ("sample.wav", data, "text/plain")}).status_code == 415
-    assert api.post(project + "/music", json={"preset": "unknown"}).status_code == 422
-    too_big = api.post(project + "/music", files={"file": ("big.wav", b"0" * (25 * 1024 * 1024 + 1), "audio/wav")})
+    hdrs = _if_match(api, project)
+    assert api.post(project + "/music", headers=hdrs, files={"file": ("sample.exe", data, "audio/wav")}).status_code == 415
+    assert api.post(project + "/music", headers=hdrs, files={"file": ("sample.wav", data, "text/plain")}).status_code == 415
+    assert api.post(project + "/music", headers=hdrs, json={"preset": "unknown"}).status_code == 422
+    too_big = api.post(
+        project + "/music",
+        headers=hdrs,
+        files={"file": ("big.wav", b"0" * (25 * 1024 * 1024 + 1), "audio/wav")},
+    )
     assert too_big.status_code == 413
 
     doc = original["timeline"]
@@ -268,7 +286,7 @@ def test_uploaded_music_and_independent_project_duplicate(project, e2e_studio):
                                      status="ready", source_start_ms=200)
     api.put(project + "/timeline", json={"expected_revision": doc["revision"], "document": doc}).raise_for_status()
     worker = media_worker(api)
-    api.post(project + "/scenes/example/revoice").raise_for_status()
+    api.post(project + "/scenes/example/revoice", headers=_if_match(api, project)).raise_for_status()
     complete_audio(api, worker, 3000)
     complete_words(api, worker, "Second")
     source = api.get(project).json()
@@ -348,10 +366,11 @@ def test_drive_music_upload_verifies_remote_checksum(project, e2e_studio, monkey
     monkeypatch.setattr(media, "httpx", mock_http)
     files = {"file": ("ambient.wav", data, "audio/wav")}
     before = api.get(project + "/timeline").json()
-    assert api.post(project + "/music", files=files).status_code == 422
+    hdrs = {"If-Match": str(before["revision"])}
+    assert api.post(project + "/music", headers=hdrs, files=files).status_code == 422
     assert api.get(project + "/timeline").json() == before
     checksum = digest
-    result = api.post(project + "/music", files=files)
+    result = api.post(project + "/music", headers=hdrs, files=files)
     assert result.is_success, result.text
     with e2e_studio.sessions() as db:
         asset = db.query(Asset).one()
@@ -366,7 +385,7 @@ def test_stale_tts_completes_for_frozen_export_after_voice_change(project, e2e_s
     doc = api.get(project + "/timeline").json()
     doc["tracks"]["visual"] = [doc["tracks"]["visual"][1]]
     api.put(project + "/timeline", json={"expected_revision": doc["revision"], "document": doc}).raise_for_status()
-    first = api.post(project + "/scenes/example/revoice").json()
+    first = api.post(project + "/scenes/example/revoice", headers=_if_match(api, project)).json()
     worker = media_worker(api)
     old_job = claim(api, worker, "tts")
     assert old_job["id"] == first["tts_job_id"]
@@ -391,7 +410,7 @@ def test_stale_tts_completes_for_frozen_export_after_voice_change(project, e2e_s
 
 def test_inserting_a_scene_moves_existing_voice_and_captions(project, e2e_studio):
     api = e2e_studio.client
-    api.post(project + "/scenes/example/revoice").raise_for_status()
+    api.post(project + "/scenes/example/revoice", headers=_if_match(api, project)).raise_for_status()
     worker = media_worker(api)
     complete_audio(api, worker, 3000)
     complete_words(api, worker, "Second")
@@ -426,3 +445,12 @@ def test_concurrent_command_conflict_rolls_back_job_dispatch(project, e2e_studio
         assert db.query(Job).count() == 0
     latest = api.get(project + "/timeline").json()
     assert latest["revision"] == revision + 1 and latest["tracks"]["visual"][0]["narration"] == "First"
+
+
+def test_revoice_and_music_require_if_match(project, e2e_studio):
+    api = e2e_studio.client
+    assert api.post(project + "/scenes/example/revoice").status_code == 422
+    assert api.post(project + "/scenes/example/revoice", headers={"If-Match": "1"}).status_code == 409
+    assert api.post(project + "/music", json={"preset": "ambient_pulse"}).status_code == 422
+    assert api.post(project + "/music", headers={"If-Match": "1"}, json={"preset": "ambient_pulse"}).status_code == 409
+    assert api.delete(project + "/music").status_code == 422

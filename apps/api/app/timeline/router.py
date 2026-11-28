@@ -4,7 +4,7 @@ from fastapi import APIRouter, Depends, Header
 from sqlalchemy.orm import Session
 
 from app.core.db import get_db
-from app.core.errors import NotFoundError
+from app.core.errors import NotFoundError, ValidationFailedError
 from app.models import Project, TimelineRevision
 from app.timeline.schemas import CommandBatchRequest, TimelineDocument, TimelinePutRequest
 from app.timeline.service import (
@@ -66,8 +66,26 @@ def list_revisions(project_id: str, db: Session = Depends(get_db)) -> list[dict]
     ]
 
 
+def _require_if_match(if_match: str | None) -> int:
+    if if_match is None:
+        raise ValidationFailedError("If-Match header with expected timeline revision is required")
+    cleaned = if_match.strip()
+    if cleaned.startswith("W/"):
+        cleaned = cleaned[2:].strip()
+    cleaned = cleaned.strip('"').strip("'")
+    if not cleaned or not cleaned.isdigit():
+        raise ValidationFailedError("If-Match header must be a numeric timeline revision")
+    return int(cleaned)
+
+
 @router.post("/revisions/{revision}/restore", response_model=TimelineDocument)
-def restore_revision(project_id: str, revision: int, db: Session = Depends(get_db)) -> TimelineDocument:
+def restore_revision(
+    project_id: str,
+    revision: int,
+    if_match: str | None = Header(default=None, alias="If-Match"),
+    db: Session = Depends(get_db),
+) -> TimelineDocument:
+    expected = _require_if_match(if_match)
     project = db.query(Project).filter(Project.id == project_id).first()
     if not project:
         raise NotFoundError(f"Project {project_id} not found")
@@ -79,4 +97,4 @@ def restore_revision(project_id: str, revision: int, db: Session = Depends(get_d
     if not target:
         raise NotFoundError(f"Revision {revision} not found")
     doc = TimelineDocument.model_validate(target.document)
-    return save_timeline_document(db, project, project.current_revision, doc, author="user")
+    return save_timeline_document(db, project, expected, doc, author="user")

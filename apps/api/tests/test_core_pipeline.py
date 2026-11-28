@@ -339,3 +339,47 @@ def test_regenerate_scene_enforces_if_match() -> None:
             json={"prompt": "Stale request"},
         )
         assert stale.status_code == 409
+
+
+def test_restore_revision_enforces_if_match() -> None:
+    with TestClient(app) as client:
+        proj = client.post(
+            "/v1/projects",
+            json={
+                "title": "Restore Concurrency Test",
+                "topic": "Electromagnetism",
+                "aspect": "16:9",
+                "target_res": "1080p",
+                "duration_preset": "reel_60s",
+                "qa_policy": "hotl_smart",
+                "brain_mode": "gemini_auto",
+            },
+        ).json()
+        pid = proj["id"]
+        sid = proj["timeline"]["tracks"]["visual"][0]["id"]
+
+        # Advance timeline from revision 1 -> 2
+        updated = client.post(
+            f"/v1/projects/{pid}/timeline/commands",
+            headers={"If-Match": "1"},
+            json={
+                "expected_revision": 1,
+                "author": "user",
+                "commands": [{"type": "edit_narration", "scene_id": sid, "narration": "Updated line"}],
+            },
+        )
+        assert updated.status_code == 200
+        assert updated.json()["revision"] == 2
+
+        missing = client.post(f"/v1/projects/{pid}/revisions/1/restore")
+        assert missing.status_code == 422
+
+        bad = client.post(f"/v1/projects/{pid}/revisions/1/restore", headers={"If-Match": "nope"})
+        assert bad.status_code == 422
+
+        stale = client.post(f"/v1/projects/{pid}/revisions/1/restore", headers={"If-Match": "1"})
+        assert stale.status_code == 409
+
+        ok = client.post(f"/v1/projects/{pid}/revisions/1/restore", headers={"If-Match": "2"})
+        assert ok.status_code == 200
+        assert ok.json()["revision"] == 3
