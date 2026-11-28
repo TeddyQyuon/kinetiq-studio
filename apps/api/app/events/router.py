@@ -4,18 +4,61 @@ import asyncio
 import logging
 from contextlib import AsyncExitStack
 
-from fastapi import APIRouter, Header, Query
+from fastapi import APIRouter, Depends, Header, Query
 from fastapi.responses import StreamingResponse
 from redis.asyncio import Redis
 from redis.exceptions import RedisError
+from sqlalchemy import func, select
+from sqlalchemy.orm import InstrumentedAttribute, Session
 
 from app.core.config import get_settings
-from app.core.db import SessionLocal
+from app.core.db import SessionLocal, get_db
 from app.events.service import CHANNEL, format_sse
-from app.models import EventOutbox
+from app.models import Asset, EventOutbox, Job, TimelineRevision, Worker
 
 router = APIRouter(prefix="/v1", tags=["events"])
 logger = logging.getLogger(__name__)
+
+
+def _metric_counts(db: Session = Depends(get_db)) -> dict:
+    def counts(column: InstrumentedAttribute[str], *states: str) -> dict[str, int]:
+        rows = dict(db.execute(select(column, func.count()).group_by(column)).all())
+        return {state: rows.get(state, 0) for state in states}
+
+    workers = counts(Worker.status, "online", "busy", "offline")
+    total_cu = db.scalar(select(func.sum(Worker.cu_used_month)))
+    revisions, backups = db.execute(
+        select(func.count(TimelineRevision.id), func.count(TimelineRevision.drive_snapshot_id))
+    ).one()
+    return {
+        "jobs": counts(Job.status, "queued", "leased", "running", "succeeded", "failed", "dead"),
+        "workers": {**workers, "total_cu_month": float(total_cu or 0)},
+        "vault": counts(Asset.sync_state, "synced", "missing", "mismatch", "pending"),
+        "snapshots": {"total_revisions": revisions, "backed_up_revisions": backups},
+    }
+
+
+async def _redis_connected(url: str) -> bool:
+    if not url:
+        return False
+    try:
+        async with asyncio.timeout(1):
+            async with Redis.from_url(url, socket_connect_timeout=1, socket_timeout=1) as client:
+                return bool(await client.ping())
+    except (RedisError, OSError, ValueError):
+        return False
+
+
+@router.get("/health/metrics")
+async def health_metrics(counts: dict = Depends(_metric_counts)) -> dict:
+    settings = get_settings()
+    return {
+        "status": "ok",
+        "env": settings.app_env,
+        "storage_provider": settings.storage_provider,
+        "redis_connected": await _redis_connected(settings.redis_url),
+        **counts,
+    }
 
 
 def _read_page(cursor: int, project_id: str | None):
