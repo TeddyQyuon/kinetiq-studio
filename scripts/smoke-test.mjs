@@ -67,6 +67,9 @@ async function main() {
     for (const path of ["/", "/create", "/workers", "/settings"]) await check("Web", base, path);
     await check("Web", base, "/api/backend-status", { json(data) {
       if (typeof data?.online !== "boolean") throw new Error("Expected backend-status JSON with an online flag");
+      if (!values["web-only"] && data.online !== true) {
+        throw new Error("Studio backend-status reports online=false (check API_INTERNAL_URL)");
+      }
     } });
   }
 

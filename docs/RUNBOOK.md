@@ -120,7 +120,8 @@ The helper restores the project, head revision and scene projection. Use a Postg
   "${dc[@]}" exec -T postgres pg_restore --list < "$dump" >/dev/null
   "${dc[@]}" stop web api orchestrator media-worker render-worker
   "${dc[@]}" exec -T postgres pg_dump -U postgres -Fc kinetiq > "storage/backups/pre_restore_$(date -u +%Y%m%dT%H%M%SZ).dump"
-  "${dc[@]}" exec -T postgres pg_restore -U postgres -d kinetiq --clean --if-exists --single-transaction < "$dump"
+  "${dc[@]}" exec -T postgres psql -U postgres -d postgres -v ON_ERROR_STOP=1 -c "DROP DATABASE IF EXISTS kinetiq WITH (FORCE);" -c "CREATE DATABASE kinetiq;"
+  "${dc[@]}" exec -T postgres pg_restore -U postgres -d kinetiq --no-owner --single-transaction < "$dump"
   git switch --detach "$good_sha"
   bash scripts/deploy-vps.sh --env-file .env --skip-backup
 )
