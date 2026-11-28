@@ -799,3 +799,206 @@ def test_chatgpt_import_rejects_malformed_json(e2e_studio) -> None:
     assert bad.status_code == 422
     assert bad.json()["error"] == "validation_failed"
     assert client.get(f"/v1/projects/{pid}").json()["current_revision"] == 1
+
+
+def test_wave2_unified_full_stack_lifecycle(e2e_studio):
+    """Follow one narrated reel from generation through render, recovery and duplication."""
+    import asyncio
+    import time
+
+    from app.models import Job, Project, Scene, TimelineRevision
+    from app.storage.snapshots import rebuild_project_from_vault, snapshot_pending_revisions
+    from app.timeline.service import get_latest_timeline
+    from test_audio_first_pipeline import claim, complete, complete_audio, complete_words
+    from test_vault_streaming_ops import database
+
+    api = e2e_studio.client
+    created = api.post("/v1/projects", json={
+        "title": "Tidal forces", "topic": "How the Moon moves the ocean", "aspect": "9:16",
+        "qa_policy": "hitl_strict_gate", "script_override": "Watch the tide rise.",
+    })
+    created.raise_for_status()
+    pid = created.json()["id"]
+    root = f"/v1/projects/{pid}"
+    timeline = root + "/timeline"
+    original, = created.json()["timeline"]["tracks"]["visual"]
+    sid = original["id"]
+
+    def if_match(revision):
+        return {"If-Match": str(revision)}
+
+    def rejects_unguarded(method, url, revision, **kwargs):
+        assert api.request(method, url, **kwargs).status_code == 422
+        stale = api.request(method, url, headers=if_match(revision - 1), **kwargs)
+        assert stale.status_code == 409, stale.text
+        assert api.get(timeline).json()["revision"] == revision
+
+    def complete_outputs(worker, job, outputs):
+        artifacts = [
+            _resumable_upload(api, worker[1], job["id"], filename=name, content_type=mime,
+                              asset_kind=kind, payload=content)
+            for kind, name, mime, content in outputs
+        ]
+        response = api.post(f"/v1/workers/jobs/{job['id']}/complete", headers=worker[1],
+                            json={"artifacts": artifacts})
+        response.raise_for_status()
+
+    generated = api.post(root + "/generate")
+    generated.raise_for_status()
+    with e2e_studio.sessions() as db:
+        jobs = db.query(Job).filter_by(project_id=pid).all()
+        assert {j.job_type for j in jobs} == {"keyframe_qwen", "tts", "align"}
+        assert len(jobs) == generated.json()["queued_jobs"] == 3
+        assert {j.id for j in jobs} == set(generated.json()["job_ids"])
+        assert all(j.status == "queued" and j.scene_id == sid for j in jobs)
+        by_type = {j.job_type: j for j in jobs}
+        assert by_type["align"].depends_on == [by_type["tts"].id]
+
+    gpu = _register_worker(api, name="GPU", profile="ltx25_pro", capabilities=["keyframe_qwen", "i2v_ltx25"])
+    key = claim(api, gpu, "keyframe_qwen")
+    complete(api, gpu, key, "keyframe", "frame.png", "image/png", TINY_PNG).raise_for_status()
+    approve = f"{root}/scenes/{sid}/approve"
+    assert api.get(timeline).json()["tracks"]["visual"][0]["status"] == "needs_review"
+    approved = api.post(approve).json()
+    clip = claim(api, gpu, "i2v_ltx25")
+    assert clip["id"] == approved["queued_job_id"]
+    complete_outputs(gpu, clip, [
+        ("master", "clip.mp4", "video/mp4", _build_mock_mp4(2048, b"master")),
+        ("proxy", "proxy.mp4", "video/mp4", _build_mock_mp4(512, b"proxy")),
+    ])
+    # Clip QA consumes completions asynchronously in the API lifespan.
+    deadline = time.monotonic() + 10
+    while api.get(timeline).json()["tracks"]["visual"][0]["status"] == "qa_checking":
+        assert time.monotonic() < deadline, "Clip QA did not finish the render review"
+        time.sleep(0.1)
+    assert api.get(timeline).json()["tracks"]["visual"][0]["status"] == "needs_review"
+    assert api.post(approve).json()["queued_job_id"] is None
+    scene = api.get(timeline).json()["tracks"]["visual"][0]
+    assert scene["status"] == "ready" and scene["assets"]["master"] and scene["assets"]["proxy"]
+
+    media = _register_worker(api, name="Media", profile="media", capabilities=["tts", "align"])
+    assert complete_audio(api, media, 4000)["scene_id"] == sid
+    assert complete_words(api, media, "Watch")["scene_id"] == sid
+    spoken = api.get(timeline).json()
+    voice, = spoken["tracks"]["voice"]
+    assert (voice["scene_id"], voice["start_ms"], voice["end_ms"]) == (sid, 0, 4000)
+    assert voice["asset"]
+    assert spoken["tracks"]["captions"]["words"] == [{"word": "Watch", "start_ms": 100, "end_ms": 500}]
+
+    rev = spoken["revision"]
+    replacement = {"expected_revision": rev - 1, "document": spoken}
+    assert api.put(timeline, json=replacement).status_code == 409
+    right_id = sid + "_right"
+    split = {"type": "split_scene", "scene_id": sid, "new_scene_id": right_id, "split_at_ms": 2000}
+    batch = {"commands": [split], "expected_revision": rev}
+    assert api.post(timeline + "/commands", json=batch, headers=if_match(rev - 1)).status_code == 409
+    cut = api.post(timeline + "/commands", json=batch, headers=if_match(rev))
+    cut.raise_for_status()
+    left, right = cut.json()["tracks"]["visual"]
+    assert (left["end_ms"], right["start_ms"], right["source_start_ms"]) == (2000, 2000, 2000)
+    assert right["assets"]["master"] == scene["assets"]["master"]
+
+    # Give the second shot its own take before freezing the export.
+    revoice = f"{root}/scenes/{right_id}/revoice"
+    rev = cut.json()["revision"]
+    rejects_unguarded("POST", revoice, rev)
+    take = api.post(revoice, headers=if_match(rev)).json()
+    assert complete_audio(api, media, 2000)["id"] == take["tts_job_id"]
+    assert complete_words(api, media, "tide")["id"] == take["align_job_id"]
+
+    before_music = api.get(timeline).json()
+    rev = before_music["revision"]
+    music = root + "/music"
+    preset = {"preset": "ambient_pulse"}
+    rejects_unguarded("POST", music, rev, json=preset)
+    mixed = api.post(music, json=preset, headers=if_match(rev)).json()
+    assert mixed["timeline"]["tracks"]["music"]["asset"] == mixed["asset_id"]
+    current = mixed["timeline"]["revision"]
+    rejects_unguarded("DELETE", music, current)
+
+    restore = root + f"/revisions/{rev}/restore"
+    rejects_unguarded("POST", restore, current)
+    restored = api.post(restore, headers=if_match(current)).json()
+    assert restored["revision"] == current + 1
+    assert restored["tracks"] == before_music["tracks"]
+    mixed = api.post(music, json=preset, headers=if_match(restored["revision"])).json()
+    frozen = mixed["timeline"]
+    exp = api.post(root + "/exports", json={"resolution": "1080p"}).json()
+    assert exp["status"] == "queued" and exp["revision"] == frozen["revision"]
+
+    renderer = _register_worker(api, name="Renderer", profile="render", capabilities=["render"])
+    render = claim(api, renderer, "render")
+    payload = render["payload"]
+    assert (payload["export_id"], payload["revision"], payload["resolution"]) == (exp["id"], frozen["revision"], "1080p")
+    tracks = payload["document"]["tracks"]
+    assert tracks["visual"][1]["source_start_ms"] == 2000
+    assert tracks["voice"] == frozen["tracks"]["voice"]
+    assert {v["scene_id"] for v in tracks["voice"]} == {sid, right_id}
+    assert voice["asset"] in {v["asset"] for v in tracks["voice"]}
+    assert tracks["captions"]["words"] == [
+        {"word": "Watch", "start_ms": 100, "end_ms": 500},
+        {"word": "tide", "start_ms": 2100, "end_ms": 2500},
+    ]
+    assert tracks["music"]["asset"] == mixed["asset_id"]
+    for aid in [scene["assets"]["master"], mixed["asset_id"], *(v["asset"] for v in tracks["voice"])]:
+        assert api.get(payload["media_urls"][aid]).is_success
+
+    movie = _build_mock_mp4(4096, b"1080p-export")
+    complete_outputs(renderer, render, [
+        ("export", "tides.mp4", "video/mp4", movie),
+        ("srt", "captions.srt", "application/x-subrip", SAMPLE_SRT.encode()),
+    ])
+    saved, = api.get(root + "/exports").json()
+    assert saved["id"] == exp["id"] and saved["status"] == "ready"
+    assert api.get(saved["srt_url"]).content == SAMPLE_SRT.encode()
+    download = f"/v1/exports/{exp['id']}/download"
+    part = api.get(download, headers={"Range": "bytes=0-63"})
+    assert part.status_code == 206 and part.content == movie[:64]
+    assert part.headers["content-range"] == f"bytes 0-63/{len(movie)}"
+    inline = api.get(download, params={"inline": 1})
+    assert inline.status_code == 200 and inline.content == movie
+    assert inline.headers["content-disposition"].split(";")[0] == "inline"
+
+    vault = e2e_studio.vault_dir
+    latest = api.get(timeline).json()
+    with e2e_studio.sessions() as db:
+        assert asyncio.run(snapshot_pending_revisions(db)) == latest["revision"]
+        owner = db.get(Project, pid).owner_id
+        revisions = db.query(TimelineRevision).filter_by(project_id=pid).all()
+        for row in revisions:
+            assert row.drive_snapshot_id == f"{pid}/history/v{row.revision}.json"
+            assert json.loads((vault / row.drive_snapshot_id).read_bytes()) == row.document
+        assert json.loads((vault / pid / "project.json").read_bytes())["document"] == latest
+
+    with database(vault.parent / "recovered.sqlite") as fresh, fresh() as db:
+        recovered = asyncio.run(rebuild_project_from_vault(db, project_id=pid, user_id=owner))
+        assert (recovered.id, recovered.owner_id, recovered.title, recovered.current_revision) == (
+            pid, owner, created.json()["title"], latest["revision"],
+        )
+        assert get_latest_timeline(db, pid).model_dump(mode="json") == latest
+        scenes = db.query(Scene).filter_by(project_id=pid).order_by(Scene.order_index).all()
+        assert [(s.id, s.kind, s.status, s.start_ms, s.end_ms, s.master_asset_id) for s in scenes] == [
+            (s["id"], s["kind"], s["status"], s["start_ms"], s["end_ms"], s["assets"]["master"])
+            for s in latest["tracks"]["visual"]
+        ]
+
+    metrics = api.get("/v1/health/metrics").json()
+    assert set(metrics) == {"status", "env", "storage_provider", "redis_connected", "jobs", "workers", "vault", "snapshots"}
+    assert (metrics["status"], metrics["env"], metrics["storage_provider"], metrics["redis_connected"]) == (
+        "ok", "phase0_local", "local", False,
+    )
+    assert set(metrics["jobs"]) == {"queued", "leased", "running", "succeeded", "failed", "dead"}
+    assert set(metrics["workers"]) == {"online", "busy", "offline", "total_cu_month"}
+    assert set(metrics["vault"]) == {"synced", "missing", "mismatch", "pending"}
+    assert set(metrics["snapshots"]) == {"total_revisions", "backed_up_revisions"}
+    assert metrics["jobs"]["succeeded"] > 0 and metrics["vault"]["synced"] > 0
+    assert metrics["snapshots"]["backed_up_revisions"] == metrics["snapshots"]["total_revisions"] == latest["revision"]
+
+    clone = api.post(root + "/duplicate").json()
+    assert clone["current_revision"] == clone["timeline"]["revision"] == 1
+    assert clone["id"] != pid
+    copied = clone["timeline"]["tracks"]
+    assert len(copied["visual"]) == len(scenes)
+    assert {s["id"] for s in copied["visual"]}.isdisjoint({sid, right_id})
+    assert not clone["media_urls"] and not copied["voice"] and copied["music"]["asset"] is None
+    assert api.get(timeline).json() == latest
