@@ -1,25 +1,94 @@
 "use client";
 
-import React, { useEffect, useState } from "react";
+import React, { useEffect, useRef, useState } from "react";
 import Link from "next/link";
 import { AlertTriangle, ArrowRight, Cpu, Download, Film, Plus, Sparkles, Video } from "lucide-react";
 import type { ProjectSummary, WorkerRecord } from "@kinetiq/contracts";
 import { api } from "@/lib/api-client";
 import { StatusBadge } from "@/components/StatusBadge";
 
+const filters = ["All", "Planned", "Generating", "Ready", "Needs Review"] as const;
+const actionStyle = "rounded px-2 py-1 text-xs text-zinc-300 hover:bg-zinc-800 disabled:opacity-50";
+
 export default function LibraryPage() {
   const [projects, setProjects] = useState<ProjectSummary[]>([]);
   const [workers, setWorkers] = useState<WorkerRecord[]>([]);
   const [isDemo, setIsDemo] = useState(false);
 
+  const [query, setQuery] = useState("");
+  const [filter, setFilter] = useState<(typeof filters)[number]>("All");
+  const [renaming, setRenaming] = useState<string | null>(null);
+  const [newTitle, setNewTitle] = useState("");
+  const [deleting, setDeleting] = useState<ProjectSummary | null>(null);
+  const [busy, setBusy] = useState(false);
+  const [loaded, setLoaded] = useState(false);
+  const [notice, setNotice] = useState("");
+  const dialog = useRef<HTMLDialogElement>(null);
+
   useEffect(() => {
+    let active = true;
     api.listProjects().then((res) => {
-      setProjects(res.data);
-      setIsDemo(res.demo);
-    });
-    api.listWorkers().then((res) => setWorkers(res.data));
+      if (active) {
+        setProjects(res.data);
+        setIsDemo(res.demo);
+        setLoaded(true);
+      }
+    }).catch((err: Error) => { if (active) setNotice(err.message); });
+    api.listWorkers().then((res) => {
+      if (active) setWorkers(res.data);
+    }).catch((err: Error) => { if (active) setNotice(err.message); });
+    return () => { active = false; };
   }, []);
 
+  useEffect(() => {
+    if (deleting) dialog.current?.showModal();
+    else dialog.current?.close();
+  }, [deleting]);
+
+  async function changeProject(operation: () => Promise<void>) {
+    setBusy(true);
+    setNotice("");
+    try {
+      await operation();
+    } catch (error) {
+      setNotice(error instanceof Error ? error.message : "Project update failed.");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  function rename(project: ProjectSummary) {
+    return changeProject(async () => {
+      const updated = await api.updateProject(project.id, { title: newTitle.trim() });
+      setProjects((items) => items.map((item) => item.id === project.id ? updated : item));
+      setRenaming(null);
+    });
+  }
+
+  function duplicate(project: ProjectSummary) {
+    return changeProject(async () => {
+      const copy = await api.duplicateProject(project.id);
+      setProjects((items) => [copy, ...items]);
+      setNotice(`Created “${copy.title}”.`);
+    });
+  }
+
+  function deleteProject() {
+    if (!deleting) return;
+    return changeProject(async () => {
+      await api.deleteProject(deleting.id);
+      setProjects((items) => items.filter((item) => item.id !== deleting.id));
+      setDeleting(null);
+    });
+  }
+
+  const search = query.trim().toLowerCase();
+  const matching = projects.filter((project) => {
+    const statusMatches = filter === "All" || (filter === "Needs Review"
+      ? project.needs_review_count > 0 || project.status === "needs_review"
+      : project.status === filter.toLowerCase());
+    return statusMatches && `${project.title} ${project.topic}`.toLowerCase().includes(search);
+  });
   const totalNeedsReview = projects.reduce((acc, p) => acc + p.needs_review_count, 0);
   const onlineWorkers = workers.filter((w) => w.status !== "offline").length;
   const cuUsed = workers.reduce((acc, w) => acc + (w.cu_used_month || 0), 0);
@@ -117,8 +186,23 @@ export default function LibraryPage() {
 
       <div className="space-y-3">
         <h2 className="text-sm font-semibold uppercase tracking-wider text-zinc-400">Your Projects</h2>
+        <div className="flex flex-wrap items-center justify-between gap-3">
+          <input type="search" aria-label="Search projects" placeholder="Search title or topic" value={query}
+            onChange={(e) => setQuery(e.target.value)}
+            className="rounded-lg border border-zinc-700 bg-zinc-900 px-3 py-2 text-sm" />
+          <div role="group" aria-label="Project status" className="flex flex-wrap gap-1">
+            {filters.map((label) => (
+              <button key={label} aria-pressed={filter === label} onClick={() => setFilter(label)}
+                className={`rounded-full px-3 py-1.5 text-xs ${filter === label ? "bg-amber-400 text-zinc-950" : "bg-zinc-800 text-zinc-300"}`}>
+                {label}
+              </button>
+            ))}
+          </div>
+        </div>
+        {notice && !deleting && <p role="status" className="text-sm text-amber-300">{notice}</p>}
+        {loaded && matching.length === 0 && <p className="py-6 text-sm text-zinc-400">No matching projects.</p>}
         <div className="grid gap-4 md:grid-cols-2">
-          {projects.map((p) => {
+          {matching.map((p) => {
             const pct = p.scene_count ? Math.round((p.ready_scenes / p.scene_count) * 100) : 0;
             return (
               <div key={p.id} className="rounded-xl border border-zinc-800 bg-[#111216] p-5 space-y-4">
@@ -133,7 +217,14 @@ export default function LibraryPage() {
                       </span>
                       <StatusBadge value={p.status} />
                     </div>
-                    <h3 className="mt-2 text-base font-bold">{p.title}</h3>
+                    {renaming === p.id ? (
+                      <form className="mt-2 flex flex-wrap gap-1" onSubmit={(e) => { e.preventDefault(); void rename(p); }}>
+                        <input autoFocus required minLength={2} maxLength={255} aria-label="Project title" value={newTitle}
+                          className="rounded bg-zinc-900 px-2 py-1" onChange={(e) => setNewTitle(e.target.value)} />
+                        <button className={actionStyle} disabled={busy || newTitle.trim().length < 2}>Save</button>
+                        <button type="button" className={actionStyle} disabled={busy} onClick={() => setRenaming(null)}>Cancel</button>
+                      </form>
+                    ) : <h3 className="mt-2 text-base font-bold">{p.title}</h3>}
                     <p className="mt-0.5 line-clamp-1 text-xs text-zinc-400">{p.topic}</p>
                   </div>
                   <div className="rounded-lg bg-zinc-900 p-2 text-zinc-400">
@@ -181,11 +272,26 @@ export default function LibraryPage() {
                     Export
                   </Link>
                 </div>
+                <div className="flex gap-1 border-t border-zinc-800 pt-2">
+                  <button className={actionStyle} disabled={busy} onClick={() => { setRenaming(p.id); setNewTitle(p.title); }}>Rename</button>
+                  <button className={actionStyle} disabled={busy} onClick={() => duplicate(p)}>Duplicate</button>
+                  <button className={actionStyle} disabled={busy} onClick={() => { setNotice(""); setDeleting(p); }}>Delete</button>
+                </div>
               </div>
             );
           })}
         </div>
       </div>
+      <dialog ref={dialog} aria-labelledby="delete-project-title" className="max-w-sm space-y-4 rounded-xl border border-zinc-700 bg-zinc-900 p-6 text-zinc-100 backdrop:bg-black/70"
+        onCancel={(e) => { if (busy) e.preventDefault(); }} onClose={() => setDeleting(null)}>
+        <h2 id="delete-project-title" className="text-lg font-semibold">Delete project?</h2>
+        <p className="text-sm text-zinc-300">Remove “{deleting?.title}” from your library? This action is permanent.</p>
+        {notice && <p role="alert" className="text-sm text-amber-300">{notice}</p>}
+        <div className="flex justify-end gap-2">
+          <button autoFocus disabled={busy} className={actionStyle} onClick={() => setDeleting(null)}>Cancel</button>
+          <button disabled={busy} className="rounded bg-rose-600 px-3 py-1.5 text-sm" onClick={deleteProject}>Delete project</button>
+        </div>
+      </dialog>
     </div>
   );
 }

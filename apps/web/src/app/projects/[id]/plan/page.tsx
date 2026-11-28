@@ -1,6 +1,6 @@
 "use client";
 
-import React, { useCallback, useEffect, useState } from "react";
+import React, { useCallback, useEffect, useRef, useState } from "react";
 import Link from "next/link";
 import { useParams } from "next/navigation";
 import {
@@ -13,7 +13,7 @@ import {
   Sparkles,
   Wand2,
 } from "lucide-react";
-import type { ProjectDetail, QAReviewRecord, StudioEvent } from "@kinetiq/contracts";
+import type { ProjectDetail, QAAnalyticsResponse, QAReviewRecord, StudioEvent } from "@kinetiq/contracts";
 import { api } from "@/lib/api-client";
 import {
   applyStudioEventToProgress,
@@ -25,24 +25,62 @@ import { useProjectEvents } from "@/lib/use-project-events";
 import { StatusBadge } from "@/components/StatusBadge";
 
 export default function PlanAndQAPage() {
-  const params = useParams<{ id: string }>();
-  const projectId = params.id;
+  const { id } = useParams<{ id: string }>();
+  return <PlanBoard key={id} projectId={id} />;
+}
+
+function PlanBoard({ projectId }: { projectId: string }) {
   const [project, setProject] = useState<ProjectDetail | null>(null);
   const [reviews, setReviews] = useState<QAReviewRecord[]>([]);
   const [sceneProgress, setSceneProgress] = useState<Record<string, SceneJobProgress>>({});
   const [busyMsg, setBusyMsg] = useState<string | null>(null);
   const [isDemo, setIsDemo] = useState(false);
 
+  const [analytics, setAnalytics] = useState<QAAnalyticsResponse | null>(null);
+  const [brief, setBrief] = useState("");
+  const [rawPlan, setRawPlan] = useState("");
+  const [pending, setPending] = useState(false);
+  const latestLoad = useRef(0);
+  const refreshTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+
   const load = useCallback(async () => {
-    const [p, r] = await Promise.all([api.getProject(projectId), api.listQAReviews(projectId)]);
-    setProject(p.data);
-    setIsDemo(p.demo);
-    setReviews(r);
+    const request = ++latestLoad.current;
+    try {
+      const [p, r, stats] = await Promise.all([
+        api.getProject(projectId), api.listQAReviews(projectId), api.getQAAnalytics(projectId).catch(() => null),
+      ]);
+      if (request !== latestLoad.current) return;
+      setProject(p.data);
+      setIsDemo(p.demo);
+      setReviews(r);
+      setAnalytics(stats);
+    } catch (error) {
+      if (request === latestLoad.current) setBusyMsg(error instanceof Error ? error.message : "Could not load storyboard.");
+    }
   }, [projectId]);
 
   useEffect(() => {
+    const notice = new URLSearchParams(window.location.search).get("notice");
+    setBusyMsg(notice === "plan_failed" ? "Project created with its initial storyboard. The AI director was unavailable. Use Re-Plan to retry."
+      : notice === "import_failed" ? "Project created. The storyboard import failed. Check the JSON and import it below." : null);
     void load();
+    return () => {
+      ++latestLoad.current;
+      if (refreshTimer.current !== null) clearTimeout(refreshTimer.current);
+    };
   }, [load]);
+
+  async function run(action: () => Promise<void>) {
+    setPending(true);
+    setBusyMsg(null);
+    try {
+      await action();
+    } catch (error) {
+      setBusyMsg(error instanceof Error ? error.message : "The action failed.");
+    } finally {
+      setPending(false);
+    }
+  }
 
   const handleLiveEvent = useCallback(
     (event: StudioEvent) => {
@@ -70,8 +108,14 @@ export default function PlanAndQAPage() {
         };
       });
 
-      if (event.event_type === "timeline.updated" || event.event_type === "project.ready") {
-        void load();
+      // Replayed events arrive in bursts. Refresh signed URLs and QA totals once per burst.
+      const refreshNeeded = ["timeline.updated", "project.ready", "qa.reviewed"].includes(event.event_type)
+        || (event.event_type === "asset.synced" && event.payload.kind === "keyframe");
+      if (refreshNeeded && refreshTimer.current === null) {
+        refreshTimer.current = setTimeout(() => {
+          refreshTimer.current = null;
+          void load();
+        }, 150);
       }
     },
     [load],
@@ -89,43 +133,18 @@ export default function PlanAndQAPage() {
 
   async function handleStartGenerate() {
     if (!project) return;
-    setBusyMsg("Dispatching keyframes to Colab GPU + Auto Vision QA...");
-    try {
-      if (!isDemo) {
-        const res = await api.startGeneration(project.id);
-        setBusyMsg(`Queued ${res.queued_jobs} keyframe job(s) for Colab.`);
-        await load();
-      } else {
-        setBusyMsg("Demo Mode: Start FastAPI + Colab worker to run live generation.");
-      }
-    } catch (e) {
-      setBusyMsg(e instanceof Error ? e.message : "Dispatch failed");
+    if (isDemo) {
+      setBusyMsg("Start FastAPI and a Colab worker to generate scenes.");
+      return;
     }
+    setBusyMsg("Dispatching scene generation jobs…");
+    const res = await api.startGeneration(project.id);
+    setBusyMsg(`Queued ${res.queued_jobs} scene generation jobs.`);
+    await load();
   }
 
   async function handleApproveScene(sceneId: string) {
     if (!project) return;
-    if (isDemo) {
-      setProject({
-        ...project,
-        timeline: {
-          ...project.timeline,
-          tracks: {
-            ...project.timeline.tracks,
-            visual: project.timeline.tracks.visual.map((s) =>
-              s.id === sceneId
-                ? {
-                    ...s,
-                    status: "ready",
-                    qa: { score: 8.5, attempts: 1, verdict: "human_approved" },
-                  }
-                : s,
-            ),
-          },
-        },
-      });
-      return;
-    }
     await api.approveScene(project.id, sceneId);
     await load();
   }
@@ -134,29 +153,6 @@ export default function PlanAndQAPage() {
     if (!project) return;
     const target = project.timeline.tracks.visual.find((s) => s.id === sceneId);
     if (!target) return;
-    if (isDemo) {
-      setProject({
-        ...project,
-        timeline: {
-          ...project.timeline,
-          tracks: {
-            ...project.timeline.tracks,
-            visual: project.timeline.tracks.visual.map((s) =>
-              s.id === sceneId
-                ? {
-                    ...s,
-                    kind: "diagram",
-                    template: "StepBreakdown",
-                    props: { title: "Visual Breakdown", steps: [target.narration] },
-                    status: "ready",
-                  }
-                : s,
-            ),
-          },
-        },
-      });
-      return;
-    }
     await api.applyCommands(project.id, project.timeline.revision, [
       {
         type: "convert_scene_to_diagram",
@@ -169,7 +165,7 @@ export default function PlanAndQAPage() {
   }
 
   if (!project) {
-    return <div className="p-8 text-sm text-zinc-400">Loading project plan &amp; QA board...</div>;
+    return <div className="p-8 text-sm text-zinc-400" role="status">{busyMsg || "Loading project plan & QA board…"}</div>;
   }
 
   const sseBadgeClass =
@@ -218,8 +214,17 @@ export default function PlanAndQAPage() {
           <h1 className="mt-2 text-2xl font-bold">{project.title} — Plan &amp; HOTL QA Board</h1>
         </div>
         <div className="flex flex-wrap gap-2.5">
+          <button disabled={pending} className="rounded-lg border border-amber-500/40 px-4 py-2 text-sm text-amber-200 disabled:opacity-50"
+            onClick={() => run(async () => {
+              await api.planProject(project.id, { brain_mode: project.brain_mode });
+              setBusyMsg(isDemo ? "Demo storyboard loaded." : "Storyboard updated.");
+              await load();
+            })}>
+            Re-Plan with AI Director
+          </button>
           <button
-            onClick={handleStartGenerate}
+            disabled={pending}
+            onClick={() => run(handleStartGenerate)}
             className="inline-flex items-center gap-2 rounded-lg bg-amber-500 px-4 py-2 text-sm font-semibold text-zinc-950 hover:bg-amber-400"
           >
             <Play className="h-4 w-4" />
@@ -236,7 +241,7 @@ export default function PlanAndQAPage() {
       </div>
 
       {busyMsg && (
-        <div className="rounded-lg border border-amber-500/30 bg-amber-500/10 px-4 py-2.5 text-xs text-amber-200">
+        <div role="status" className="rounded-lg border border-amber-500/30 bg-amber-500/10 px-4 py-2.5 text-xs text-amber-200">
           {busyMsg}
         </div>
       )}
@@ -263,6 +268,46 @@ export default function PlanAndQAPage() {
         </div>
       </div>
 
+      <section className="space-y-3">
+        <h2 className="text-sm font-semibold">Model QA Analytics</h2>
+        {analytics ? <div className="grid gap-3 sm:grid-cols-3">
+          {(["ltx25_fp8", "wan22_i2v", "qwen_image"] as const).map((model) => {
+            const stats = analytics.models[model];
+            return <div key={model} className="rounded-lg border border-zinc-800 bg-[#111216] p-3">
+              <h3 className="font-mono text-xs text-zinc-300">{model}</h3>
+              <div className="mt-1 text-sm font-semibold">{stats?.pass_rate == null ? "No rated renders" : `${Math.round(stats.pass_rate * 100)}% pass rate`}</div>
+              <div className="text-xs text-zinc-400">{stats?.reviews ?? 0} reviews · {stats?.retry_count ?? 0} retries</div>
+            </div>;
+          })}
+        </div> : <p className="text-xs text-zinc-400">QA analytics unavailable.</p>}
+      </section>
+
+      <details className="rounded-xl border border-zinc-800 bg-[#111216] p-4" onToggle={(e) => {
+        if (e.currentTarget.open && !brief) {
+          api.getChatGPTBrief(projectId).then((result) => {
+            setBrief(`${result.instructions}\n\n${JSON.stringify(result.schema_hint, null, 2)}`);
+          }).catch((error: Error) => setBusyMsg(error.message));
+        }
+      }}>
+        <summary className="cursor-pointer text-sm font-semibold">Import ChatGPT JSON</summary>
+        <div className="mt-4 grid gap-3">
+          {brief && <label className="text-xs text-zinc-400">Director brief
+            <textarea readOnly rows={4} className="mt-1 block w-full rounded bg-zinc-900 p-2 font-mono text-zinc-200" value={brief} />
+          </label>}
+          <label className="text-xs text-zinc-400">Storyboard JSON
+            <textarea value={rawPlan} onChange={(e) => setRawPlan(e.target.value)} rows={5}
+              className="mt-1 block w-full rounded border border-zinc-700 bg-zinc-950 p-3 font-mono text-zinc-200" />
+          </label>
+          <button disabled={pending || !rawPlan.trim()} className="justify-self-start rounded bg-amber-500 px-3 py-2 text-xs font-semibold text-zinc-950 disabled:opacity-50"
+            onClick={() => run(async () => {
+              await api.importChatGPTPlan(project.id, rawPlan);
+              setRawPlan("");
+              setBusyMsg("Storyboard imported.");
+              await load();
+            })}>Import storyboard</button>
+        </div>
+      </details>
+
       <div className="space-y-3">
         <h2 className="text-sm font-semibold uppercase tracking-wider text-zinc-400">
           Scene Storyboard &amp; Automatic Gemini Vision QA ({project.timeline.tracks.visual.length}{" "}
@@ -272,6 +317,7 @@ export default function PlanAndQAPage() {
         <div className="grid gap-3">
           {project.timeline.tracks.visual.map((scene, idx) => {
             const review = reviews.find((r) => r.scene_id === scene.id);
+            const thumbnail = scene.assets?.keyframe ? project.media_urls[scene.assets.keyframe] : null;
             const liveProg = sceneProgress[scene.id];
             const needsHuman = scene.status === "needs_review";
             return (
@@ -284,6 +330,10 @@ export default function PlanAndQAPage() {
                 }`}
               >
                 <div className="flex flex-wrap items-start justify-between gap-4">
+                  {thumbnail && !thumbnail.startsWith("mock://") && (
+                    <img src={thumbnail} alt={`Keyframe for scene ${idx + 1}`} width={128} height={72}
+                      loading="lazy" className="max-h-24 w-32 rounded-lg bg-zinc-900 object-contain" />
+                  )}
                   <div className="space-y-1.5 flex-1">
                     <div className="flex flex-wrap items-center gap-2">
                       <span className="font-mono text-xs text-zinc-400">
@@ -331,26 +381,27 @@ export default function PlanAndQAPage() {
 
                   <div className="flex flex-wrap gap-2">
                     {needsHuman && (
-                      <>
-                        <button
-                          onClick={() => handleApproveScene(scene.id)}
+                      <button disabled={pending}
+                          onClick={() => run(() => handleApproveScene(scene.id))}
                           className="inline-flex items-center gap-1.5 rounded-lg bg-emerald-500 px-3 py-1.5 text-xs font-semibold text-zinc-950 hover:bg-emerald-400"
                         >
                           <CheckCircle className="h-3.5 w-3.5" />
                           Approve &amp; Render Clip
                         </button>
-                        <button
-                          onClick={() => handleConvertToDiagram(scene.id)}
+                    )}
+                    {scene.kind !== "diagram" && (
+                        <button disabled={pending}
+                          onClick={() => run(() => handleConvertToDiagram(scene.id))}
                           className="inline-flex items-center gap-1.5 rounded-lg border border-cyan-500/40 bg-cyan-500/10 px-3 py-1.5 text-xs font-medium text-cyan-200 hover:bg-cyan-500/20"
                         >
                           <Wand2 className="h-3.5 w-3.5" />
                           Convert to Diagram
                         </button>
-                      </>
                     )}
                     {!isDemo && scene.kind !== "diagram" && (
                       <button
-                        onClick={() => api.regenerateScene(project.id, scene.id, {}).then(load)}
+                        disabled={pending}
+                        onClick={() => run(async () => { await api.regenerateScene(project.id, scene.id, {}, project.timeline.revision); await load(); })}
                         className="inline-flex items-center gap-1.5 rounded-lg border border-zinc-700 bg-zinc-900 px-3 py-1.5 text-xs text-zinc-300 hover:bg-zinc-800"
                       >
                         <RefreshCw className="h-3.5 w-3.5" />

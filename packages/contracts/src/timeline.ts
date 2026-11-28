@@ -1,7 +1,7 @@
 export type AspectRatio = "9:16" | "16:9";
 export type TargetResolution = "720p" | "1080p" | "4k";
 export type QAPolicy = "hotl_smart" | "hitl_strict_gate" | "full_auto";
-export type BrainMode = "gemini_auto" | "chatgpt_bridge" | "openai_api";
+export type BrainMode = "gemini_auto" | "chatgpt_bridge" | "openai_api" | "colab_ai";
 
 export type SceneKind = "ai_video" | "diagram" | "image_motion";
 export type SceneStatus =

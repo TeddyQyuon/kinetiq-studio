@@ -1,6 +1,7 @@
 import React from "react";
 import {
   AbsoluteFill,
+  Audio,
   Img,
   Sequence,
   Video,
@@ -10,11 +11,13 @@ import {
   useVideoConfig,
 } from "remotion";
 import type {
+  CaptionTrackConfig,
   DiagramProps,
   DiagramTemplate,
   OverlayItem,
   TimelineDocument,
   VisualSceneItem,
+  WordTiming,
 } from "@kinetiq/contracts";
 
 export interface EduCompositionProps {
@@ -621,22 +624,30 @@ const VisualSceneLayer: React.FC<{
 
 const KineticCaptionBar: React.FC<{
   scenes: VisualSceneItem[];
-  accentColor: string;
-  position: "bottom" | "center_lower";
+  captions: CaptionTrackConfig;
   isVertical: boolean;
-}> = ({ scenes, accentColor, position, isVertical }) => {
+}> = ({ scenes, captions, isVertical }) => {
   const frame = useCurrentFrame();
   const { fps } = useVideoConfig();
-  const currentMs = (frame / fps) * 1000;
-
-  const active = scenes.find((s) => currentMs >= s.start_ms && currentMs < s.end_ms);
-  if (!active) return null;
-
-  const words = active.narration.split(/\s+/).filter(Boolean);
-  const relProgress = (currentMs - active.start_ms) / Math.max(1, active.end_ms - active.start_ms);
-  const activeIdx = Math.min(words.length - 1, Math.floor(relProgress * words.length));
+  const currentMs = frame * 1000 / fps;
+  let words: WordTiming[] | string[];
+  let activeIdx: number;
+  if (captions.words?.length) {
+    words = captions.words;
+    activeIdx = words.findIndex((word) => word.start_ms <= currentMs && currentMs < word.end_ms);
+    if (activeIdx < 0) return null;
+  } else {
+    const scene = scenes.find((item) => item.start_ms <= currentMs && currentMs < item.end_ms);
+    if (!scene) return null;
+    words = scene.narration.split(/\s+/).filter(Boolean);
+    if (!words.length) return null;
+    const progress = (currentMs - scene.start_ms) / (scene.end_ms - scene.start_ms);
+    activeIdx = Math.floor(progress * words.length);
+  }
   const chunkStart = Math.floor(activeIdx / 5) * 5;
   const visibleWords = words.slice(chunkStart, chunkStart + 5);
+  const clean = captions.style === "clean_subtitle";
+  const bold = captions.style === "bold_reels";
 
   return (
     <div
@@ -644,7 +655,7 @@ const KineticCaptionBar: React.FC<{
         position: "absolute",
         left: "6%",
         right: "6%",
-        bottom: isVertical ? (position === "center_lower" ? "26%" : "20%") : "8%",
+        bottom: captions.position === "center_lower" ? "26%" : isVertical ? "20%" : "8%",
         display: "flex",
         justifyContent: "center",
         pointerEvents: "none",
@@ -652,8 +663,8 @@ const KineticCaptionBar: React.FC<{
     >
       <div
         style={{
-          backgroundColor: "rgba(9, 9, 11, 0.82)",
-          border: "1px solid rgba(255,255,255,0.14)",
+          backgroundColor: bold ? "transparent" : clean ? "rgba(0,0,0,0.68)" : "rgba(9,9,11,0.82)",
+          border: clean || bold ? "none" : "1px solid rgba(255,255,255,0.14)",
           padding: "12px 22px",
           borderRadius: 14,
           display: "flex",
@@ -663,20 +674,21 @@ const KineticCaptionBar: React.FC<{
           fontFamily: "system-ui, -apple-system, sans-serif",
         }}
       >
-        {visibleWords.map((w, i) => {
-          const globalIdx = chunkStart + i;
-          const isCurrent = globalIdx === activeIdx;
+        {visibleWords.map((entry, i) => {
+          const word = typeof entry === "string" ? entry : entry.word;
+          const isCurrent = chunkStart + i === activeIdx;
           return (
             <span
-              key={`${globalIdx}-${w}`}
+              key={chunkStart + i}
               style={{
-                fontSize: isVertical ? 38 : 30,
-                fontWeight: 800,
-                color: isCurrent ? accentColor : "#F8FAFC",
+                fontSize: (isVertical ? 38 : 30) * (bold ? 1.28 : 1),
+                fontWeight: clean ? 500 : bold ? 950 : 800,
+                textTransform: bold ? "uppercase" : "none",
+                color: isCurrent ? captions.accent_color : "#F8FAFC",
                 textShadow: "0 2px 10px rgba(0,0,0,0.8)",
               }}
             >
-              {w}
+              {word}
             </span>
           );
         })}
@@ -710,6 +722,18 @@ export const EduComposition: React.FC<EduCompositionProps> = ({ document, mediaU
   const { fps } = useVideoConfig();
   const isVertical = document.format.aspect === "9:16";
 
+  const voices = document.tracks.voice.flatMap((clip) => {
+    const src = clip.asset && mediaUrls[clip.asset];
+    if (!src || src.startsWith("mock://")) return [];
+    // Include exactly the frames in the half-open voice interval [start_ms, end_ms).
+    const from = Math.ceil(clip.start_ms * fps / 1000);
+    const end = Math.ceil(clip.end_ms * fps / 1000);
+    if (end <= from) return [];
+    return [{ key: `${clip.scene_id}-${clip.start_ms}-${clip.asset}`, from, end, src }];
+  });
+  const music = document.tracks.music;
+  const musicUrl = music.asset && mediaUrls[music.asset];
+
   return (
     <AbsoluteFill style={{ backgroundColor: "#09090B" }}>
       {document.tracks.visual.map((scene) => {
@@ -726,6 +750,21 @@ export const EduComposition: React.FC<EduCompositionProps> = ({ document, mediaU
         );
       })}
 
+      {voices.map(({ key, src, from, end }) => (
+        <Sequence key={key} from={from} durationInFrames={end - from} layout="none">
+          <Audio src={src} />
+        </Sequence>
+      ))}
+      {musicUrl && !musicUrl.startsWith("mock://") && (
+        <Audio
+          src={musicUrl}
+          loop
+          loopVolumeCurveBehavior="extend"
+          volume={(frame) => music.volume * (
+            voices.some(({ from, end }) => frame >= from && frame < end) ? 10 ** (music.duck_db / 20) : 1
+          )}
+        />
+      )}
       {document.tracks.overlays.map((ov) => {
         const from = Math.round((ov.start_ms / 1000) * fps);
         const duration = Math.max(1, Math.round(((ov.end_ms - ov.start_ms) / 1000) * fps));
@@ -739,8 +778,7 @@ export const EduComposition: React.FC<EduCompositionProps> = ({ document, mediaU
       {document.tracks.captions.enabled && (
         <KineticCaptionBar
           scenes={document.tracks.visual}
-          accentColor={document.tracks.captions.accent_color}
-          position={document.tracks.captions.position}
+          captions={document.tracks.captions}
           isVertical={isVertical}
         />
       )}

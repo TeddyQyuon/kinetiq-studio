@@ -14,7 +14,8 @@ export async function GET() {
       signal: AbortSignal.timeout(3000),
       cache: "no-store",
     });
-    return NextResponse.json({ online: res.ok });
+    const health = res.ok ? await res.json() : null;
+    return NextResponse.json({ online: res.ok || res.status === 401, env: health?.env });
   } catch {
     return NextResponse.json({ online: false });
   }

@@ -1,4 +1,5 @@
 import { create } from "zustand";
+import { saveDemoTimeline } from "@/lib/demo-workspace";
 import {
   applyCommandBatch,
   type CopilotProposal,
@@ -45,6 +46,7 @@ function buildExactInverse(
           scene_id: orig.id,
           start_ms: orig.start_ms,
           end_ms: orig.end_ms,
+          source_start_ms: orig.source_start_ms ?? 0,
         },
         { type: "tighten_pauses", max_gap_ms: 0 },
       ];
@@ -65,6 +67,7 @@ function buildExactInverse(
           scene_id: orig.id,
           start_ms: orig.start_ms,
           end_ms: orig.end_ms,
+          source_start_ms: orig.source_start_ms ?? 0,
         },
         { type: "tighten_pauses", max_gap_ms: 0 },
       ];
@@ -115,6 +118,7 @@ interface EditorState {
     serverDoc: TimelineDocument,
     mediaUrls: Record<string, string>,
     isDemo: boolean,
+    isActive?: () => boolean,
   ) => Promise<void>;
   selectScene: (sceneId: string | null) => void;
   dispatchLocalCommand: (cmd: TimelineCommand, label?: string) => TimelineDocument | null;
@@ -132,6 +136,23 @@ interface EditorState {
   mergeMediaUrls: (urls: Record<string, string>) => void;
   setOpfsCachedAsset: (assetId: string, blobUrl: string) => void;
   clearOpfsCachedAssets: () => void;
+}
+
+function applyEditorCommands(
+  state: EditorState,
+  commands: TimelineCommand[],
+) {
+  if (!state.document) return null;
+  try {
+    const result = applyCommandBatch(state.document, commands);
+    if (state.isDemo) {
+      result.doc = saveDemoTimeline(state.document.project_id, result.doc, state.serverRevision, commands.length);
+    }
+    return result;
+  } catch (error) {
+    state.setSyncState("conflict", error instanceof Error ? error.message : "Could not apply timeline edits.");
+    return null;
+  }
 }
 
 function persistCurrentDraft(
@@ -219,9 +240,10 @@ export const useEditorStore = create<EditorState>((set, get) => ({
     });
   },
 
-  hydrateWithAutosave: async (projectId, serverDoc, mediaUrls, isDemo) => {
+  hydrateWithAutosave: async (projectId, serverDoc, mediaUrls, isDemo, isActive = () => true) => {
     const switchingProject = get().projectId !== projectId;
     const draft = await loadEditorDraft(projectId);
+    if (!isActive()) return;
 
     const hasMeaningfulDraft =
       draft !== null &&
@@ -229,19 +251,23 @@ export const useEditorStore = create<EditorState>((set, get) => ({
       (draft.dirty || draft.undoStack.length > 0 || draft.redoStack.length > 0);
 
     if (hasMeaningfulDraft) {
-      if (isDemo) {
+      if (isDemo && draft.document.revision >= serverDoc.revision) {
+        // Recover unsynced IndexedDB drafts from earlier Studio versions or a new browser session.
+        const restored = draft.document.revision > serverDoc.revision
+          ? saveDemoTimeline(projectId, draft.document, serverDoc.revision)
+          : serverDoc;
         set({
           projectId,
-          document: draft.document,
-          serverRevision: draft.serverRevision,
+          document: restored,
+          serverRevision: restored.revision,
           mediaUrls,
           opfsCachedAssets: switchingProject ? {} : get().opfsCachedAssets,
-          selectedSceneId: resolveSelectedScene(draft.document, draft.selectedSceneId),
+          selectedSceneId: resolveSelectedScene(restored, draft.selectedSceneId),
           undoStack: draft.undoStack.slice(-MAX_HISTORY),
           redoStack: draft.redoStack.slice(-MAX_HISTORY),
           pendingProposal: null,
           isDemo: true,
-          dirty: draft.dirty,
+          dirty: false,
           autosaveStatus: "restored",
           lastSavedAt: draft.updatedAt,
           restoredFromDraft: true,
@@ -249,10 +275,11 @@ export const useEditorStore = create<EditorState>((set, get) => ({
           syncError: null,
           sceneProgress: switchingProject ? {} : get().sceneProgress,
         });
+        if (restored !== serverDoc) persistCurrentDraft(get, set);
         return;
       }
 
-      if (draft.serverRevision === serverDoc.revision) {
+      if (!isDemo && draft.serverRevision === serverDoc.revision) {
         set({
           projectId,
           document: draft.document,
@@ -275,7 +302,7 @@ export const useEditorStore = create<EditorState>((set, get) => ({
         return;
       }
 
-      if (draft.dirty) {
+      if (!isDemo && draft.dirty) {
         set({
           projectId,
           document: draft.document,
@@ -301,7 +328,7 @@ export const useEditorStore = create<EditorState>((set, get) => ({
       await clearEditorDraft(projectId);
     }
 
-    get().hydrate(projectId, serverDoc, mediaUrls, isDemo);
+    if (isActive()) get().hydrate(projectId, serverDoc, mediaUrls, isDemo);
   },
 
   selectScene: (sceneId) => {
@@ -316,7 +343,8 @@ export const useEditorStore = create<EditorState>((set, get) => ({
     const doc = get().document;
     if (!doc || commands.length === 0) return null;
 
-    const res = applyCommandBatch(doc, commands);
+    const res = applyEditorCommands(get(), commands);
+    if (!res) return null;
     const exactInverse = buildExactInverse(doc, commands, res.inverses);
     const entry: TimelineHistoryEntry = {
       id: makeEntryId(),
@@ -328,10 +356,11 @@ export const useEditorStore = create<EditorState>((set, get) => ({
 
     set((state) => ({
       document: res.doc,
+      serverRevision: state.isDemo ? res.doc.revision : state.serverRevision,
       selectedSceneId: resolveSelectedScene(res.doc, state.selectedSceneId),
       undoStack: [...state.undoStack, entry].slice(-MAX_HISTORY),
       redoStack: [],
-      dirty: true,
+      dirty: !state.isDemo,
       syncStatus: state.isDemo ? "offline" : "dirty",
       syncError: null,
     }));
@@ -355,14 +384,16 @@ export const useEditorStore = create<EditorState>((set, get) => ({
     if (!document || undoStack.length === 0) return null;
 
     const entry = undoStack[undoStack.length - 1];
-    const res = applyCommandBatch(document, entry.inverse);
+    const res = applyEditorCommands(get(), entry.inverse);
+    if (!res) return null;
 
     set((state) => ({
       document: res.doc,
+      serverRevision: state.isDemo ? res.doc.revision : state.serverRevision,
       selectedSceneId: resolveSelectedScene(res.doc, state.selectedSceneId),
       undoStack: undoStack.slice(0, -1),
       redoStack: [...redoStack, entry].slice(-MAX_HISTORY),
-      dirty: true,
+      dirty: !state.isDemo,
       syncStatus: isDemo ? "offline" : "dirty",
       syncError: null,
     }));
@@ -376,14 +407,16 @@ export const useEditorStore = create<EditorState>((set, get) => ({
     if (!document || redoStack.length === 0) return null;
 
     const entry = redoStack[redoStack.length - 1];
-    const res = applyCommandBatch(document, entry.forward);
+    const res = applyEditorCommands(get(), entry.forward);
+    if (!res) return null;
 
     set((state) => ({
       document: res.doc,
+      serverRevision: state.isDemo ? res.doc.revision : state.serverRevision,
       selectedSceneId: resolveSelectedScene(res.doc, state.selectedSceneId),
       redoStack: redoStack.slice(0, -1),
       undoStack: [...undoStack, entry].slice(-MAX_HISTORY),
-      dirty: true,
+      dirty: !state.isDemo,
       syncStatus: isDemo ? "offline" : "dirty",
       syncError: null,
     }));
@@ -427,7 +460,7 @@ export const useEditorStore = create<EditorState>((set, get) => ({
       serverRevision: serverDoc.revision,
       selectedSceneId: resolveSelectedScene(serverDoc, state.selectedSceneId),
       dirty: false,
-      syncStatus: "synced",
+      syncStatus: state.isDemo ? "offline" : "synced",
       syncError: null,
     }));
     persistCurrentDraft(get, set);
@@ -442,7 +475,7 @@ export const useEditorStore = create<EditorState>((set, get) => ({
     if (projectId) {
       await clearEditorDraft(projectId);
     }
-    if (projectId) {
+    if (projectId && projectId === get().projectId) {
       get().hydrate(projectId, freshServerDoc, mediaUrls, isDemo);
     }
   },

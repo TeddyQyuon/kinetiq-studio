@@ -146,7 +146,7 @@ export function useProjectEvents({
       }
 
       const url = `${API_BASE}/v1/events?${params.toString()}`;
-      const es = new EventSource(url);
+      const es = new EventSource(url, { withCredentials: true });
       currentSource = es;
 
       const namedListeners: Array<{ type: string; fn: EventListener }> = [];

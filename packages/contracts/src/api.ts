@@ -119,3 +119,53 @@ export interface DirectorBriefExport {
   instructions: string;
   schema_hint: Record<string, unknown>;
 }
+
+export interface IdentityStatus {
+  user_id: string;
+  email: string;
+  display_name: string;
+  drive_connected: boolean;
+  storage_provider: string;
+  gemini_configured: boolean;
+  openai_configured: boolean;
+  mcp_configured: boolean;
+  csrf_token?: string | null;
+  auth_required?: boolean;
+}
+
+export interface QAAnalyticsModelStats {
+  reviews: number;
+  passed: number;
+  pass_rate: number | null;
+  retry_count: number;
+}
+
+export interface QAAnalyticsResponse {
+  project_id: string;
+  models: Record<string, QAAnalyticsModelStats>;
+}
+
+export interface HealthMetricsResponse {
+  status: string;
+  env: string;
+  storage_provider: string;
+  redis_connected: boolean;
+  jobs: Record<"queued" | "leased" | "running" | "succeeded" | "failed" | "dead", number>;
+  workers: { online: number; busy: number; offline: number; total_cu_month: number };
+  vault: Record<"synced" | "missing" | "mismatch" | "pending", number>;
+  snapshots: { total_revisions: number; backed_up_revisions: number };
+}
+
+export interface RevisionSummary {
+  revision: number;
+  author: string;
+  commands_count: number;
+  drive_snapshot_id: string | null;
+  created_at: string;
+}
+
+export interface MusicUploadResponse {
+  asset_id: string;
+  media_url: string;
+  timeline: TimelineDocument;
+}
