@@ -42,7 +42,9 @@ def google_oauth_start(response: Response) -> OAuthStartResponse:
     auth_url, state, cookie = start_google_oauth()
     response.headers["Cache-Control"] = "no-store"
     if cookie:
-        response.set_cookie(PKCE, cookie, max_age=PKCE_TTL, httponly=True, secure=True, samesite="lax")
+        response.set_cookie(
+            PKCE, cookie, max_age=PKCE_TTL, httponly=True, secure=True, samesite=get_settings().cookie_samesite
+        )
     return OAuthStartResponse(auth_url=auth_url, state=state)
 
 
@@ -57,7 +59,7 @@ async def google_oauth_callback(
     credential = await complete_google_oauth(db, code=code, state=state, cookie=request.cookies.get(PKCE, ""))
     response = RedirectResponse(url=f"{settings.public_web_url}/settings?drive=connected")
     if settings.app_env == "phase1_vps":
-        response.delete_cookie(PKCE, secure=True, httponly=True)
+        response.delete_cookie(PKCE, secure=True, httponly=True, samesite=settings.cookie_samesite)
         issue_session(response, credential.id)
     return response
 
@@ -68,5 +70,5 @@ def logout(response: Response, db: Session = Depends(get_db)) -> dict[str, bool]
     db.query(OAuthCredential).filter(OAuthCredential.user_id == user.id).delete()
     db.commit()
     for name in (SESSION, CSRF):
-        response.delete_cookie(name, secure=True, httponly=name == SESSION, samesite="lax")
+        response.delete_cookie(name, secure=True, httponly=name == SESSION, samesite=get_settings().cookie_samesite)
     return {"ok": True}

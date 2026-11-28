@@ -23,6 +23,7 @@ class Settings(BaseSettings):
 
     encryption_master_key: str = "dev-only-32-byte-base64-key-change-before-prod"
     session_secret: str = "dev-only-session-secret-change-me"
+    cookie_samesite: Literal["lax", "none"] = "lax"
     media_signing_secret: str = "dev-only-media-hmac-secret-change-me"
     mcp_access_token: str = ""
 

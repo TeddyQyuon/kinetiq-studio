@@ -74,17 +74,6 @@ function buildExactInverse(
     }
   }
 
-  const convertedIds = new Set(
-    commands.filter((c) => c.type === "convert_scene_to_diagram").map((c) => c.scene_id),
-  );
-  if (convertedIds.size > 0) {
-    return fallbackInverses.flatMap((inv): TimelineCommand[] =>
-      inv.type === "restore_scene" && convertedIds.has(inv.scene.id)
-        ? [{ type: "delete_scene", scene_id: inv.scene.id }, inv]
-        : [inv],
-    );
-  }
-
   return fallbackInverses;
 }
 

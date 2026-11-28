@@ -13,7 +13,7 @@ import {
   Sparkles,
   Wand2,
 } from "lucide-react";
-import type { ProjectDetail, QAAnalyticsResponse, QAReviewRecord, StudioEvent } from "@kinetiq/contracts";
+import type { ProjectDetail, QAAnalyticsResponse, QAReviewRecord, StudioEvent, WorkerRecord } from "@kinetiq/contracts";
 import { api } from "@/lib/api-client";
 import {
   applyStudioEventToProgress,
@@ -22,6 +22,7 @@ import {
   type SceneJobProgress,
 } from "@/lib/live-events";
 import { useProjectEvents } from "@/lib/use-project-events";
+import { hasLowVram, isOnlineGpuWorker } from "@/lib/worker-capabilities";
 import { StatusBadge } from "@/components/StatusBadge";
 
 export default function PlanAndQAPage() {
@@ -31,6 +32,9 @@ export default function PlanAndQAPage() {
 
 function PlanBoard({ projectId }: { projectId: string }) {
   const [project, setProject] = useState<ProjectDetail | null>(null);
+  // SSE overlays can change displayed status and QA before a timeline revision is saved.
+  const [savedTimeline, setSavedTimeline] = useState<ProjectDetail["timeline"] | null>(null);
+  const [gpuWorkers, setGpuWorkers] = useState<WorkerRecord[]>([]);
   const [reviews, setReviews] = useState<QAReviewRecord[]>([]);
   const [sceneProgress, setSceneProgress] = useState<Record<string, SceneJobProgress>>({});
   const [busyMsg, setBusyMsg] = useState<string | null>(null);
@@ -46,11 +50,14 @@ function PlanBoard({ projectId }: { projectId: string }) {
   const load = useCallback(async () => {
     const request = ++latestLoad.current;
     try {
-      const [p, r, stats] = await Promise.all([
+      const [p, r, stats, fleet] = await Promise.all([
         api.getProject(projectId), api.listQAReviews(projectId), api.getQAAnalytics(projectId).catch(() => null),
+        api.listWorkers().catch(() => null),
       ]);
       if (request !== latestLoad.current) return;
       setProject(p.data);
+      setSavedTimeline(p.data.timeline);
+      setGpuWorkers(fleet && fleet.demo === p.demo ? fleet.data.filter(isOnlineGpuWorker) : []);
       setIsDemo(p.demo);
       setReviews(r);
       setAnalytics(stats);
@@ -109,7 +116,7 @@ function PlanBoard({ projectId }: { projectId: string }) {
       });
 
       // Replayed events arrive in bursts. Refresh signed URLs and QA totals once per burst.
-      const refreshNeeded = ["timeline.updated", "project.ready", "qa.reviewed"].includes(event.event_type)
+      const refreshNeeded = ["timeline.updated", "project.ready", "qa.reviewed", "worker.online", "worker.offline"].includes(event.event_type)
         || (event.event_type === "asset.synced" && event.payload.kind === "keyframe");
       if (refreshNeeded && refreshTimer.current === null) {
         refreshTimer.current = setTimeout(() => {
@@ -164,9 +171,18 @@ function PlanBoard({ projectId }: { projectId: string }) {
     await load();
   }
 
-  if (!project) {
+  if (!project || !savedTimeline) {
     return <div className="p-8 text-sm text-zinc-400" role="status">{busyMsg || "Loading project plan & QA board…"}</div>;
   }
+
+  // The scheduler routes every AI video without an explicit Wan model to LTX.
+  const ltxScenes = savedTimeline.tracks.visual
+    .map((scene, index) => ({ scene, index }))
+    .filter(({ scene }) => scene.kind === "ai_video" && scene.model !== "wan22_i2v");
+  const hasWanWorker = gpuWorkers.some(worker => worker.capabilities.includes("i2v_wan22"));
+  const showProfileMismatch = ltxScenes.length > 0
+    && !gpuWorkers.some(worker => worker.capabilities.includes("i2v_ltx25"))
+    && (hasWanWorker || gpuWorkers.some(hasLowVram));
 
   const sseBadgeClass =
     sseStatus === "connected"
@@ -244,6 +260,30 @@ function PlanBoard({ projectId }: { projectId: string }) {
         <div role="status" className="rounded-lg border border-amber-500/30 bg-amber-500/10 px-4 py-2.5 text-xs text-amber-200">
           {busyMsg}
         </div>
+      )}
+
+      {showProfileMismatch && (
+        <aside className="space-y-3 rounded-lg border border-amber-500/40 bg-amber-500/10 px-4 py-3 text-sm text-amber-200">
+          <p role="status">
+            {ltxScenes.length} AI {ltxScenes.length === 1 ? "scene needs" : "scenes need"} LTX-2.5. No online GPU worker provides it.{" "}
+            {hasWanWorker ? "Wan 2.2 Fast is available on an online worker." : "Start the wan22_fast profile on the lower-VRAM worker to generate with Wan 2.2 Fast."}{" "}
+            Switching selects Wan for future clip jobs.
+          </p>
+          <button type="button" disabled={pending}
+            className="rounded-md border border-amber-500/50 px-3 py-1.5 font-semibold hover:bg-amber-500/15 disabled:opacity-50"
+            onClick={() => run(async () => {
+              try {
+                await api.applyCommands(project.id, savedTimeline.revision, ltxScenes.map(({ scene, index }) => ({
+                  type: "restore_scene", scene: { ...scene, model: "wan22_i2v" }, index,
+                })));
+                setBusyMsg("AI scenes switched to Wan 2.2 Fast.");
+              } finally {
+                await load();
+              }
+            })}>
+            Switch AI scenes to Wan 2.2 Fast
+          </button>
+        </aside>
       )}
 
       <div className="rounded-xl border border-zinc-800 bg-[#111216] p-5">

@@ -8,6 +8,7 @@
  */
 
 import fs from "node:fs";
+import { spawnSync } from "node:child_process";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
 
@@ -209,11 +210,30 @@ function parseHttpsUrl(errors, env, key) {
   return parsed;
 }
 
+function crossSiteCookieWarning(web, api) {
+  if (web.hostname === api.hostname) return null;
+  const advice = "Set COOKIE_SAMESITE=none for cross-site Studio sign-in and API requests.";
+  const lastTwoLabels = (host) => host.split(".").slice(-2).join(".");
+  if (lastTwoLabels(web.hostname) !== lastTwoLabels(api.hostname)) {
+    return `PUBLIC_WEB_URL and PUBLIC_API_URL are on different sites. ${advice}`;
+  }
+  // Sibling hosts can still be separate sites, e.g. tenants under vercel.app or co.uk.
+  const psl = spawnSync("psl", ["--batch", "--print-reg-domain", "--", web.hostname, api.hostname],
+    { encoding: "utf8", timeout: 2000, windowsHide: true });
+  if (psl.status === 0) {
+    const [webSite, apiSite] = psl.stdout.trim().split(/\s+/);
+    if (webSite && apiSite && webSite !== "(null)" && apiSite !== "(null)") {
+      return webSite === apiSite ? null : advice;
+    }
+  }
+  return `Verify whether ${web.hostname} and ${api.hostname} share a registrable domain. ${advice} Same-site hosts can keep lax.`;
+}
+
 /**
  * Validate a map of environment variables for Phase 1 VPS deployment.
  * Returns `{ ok, errors, warnings, domains }`. Never includes secret values.
  */
-export function validateProductionEnv(rawEnv) {
+export function validateProductionEnv(rawEnv, { apiOnly = false } = {}) {
   const env = rawEnv ?? {};
   const errors = [];
   const warnings = [];
@@ -252,7 +272,7 @@ export function validateProductionEnv(rawEnv) {
   }
 
   // 3. Caddy domains
-  const studioDomain = validateDomain(errors, env, "STUDIO_DOMAIN");
+  const studioDomain = apiOnly ? null : validateDomain(errors, env, "STUDIO_DOMAIN");
   const apiDomain = validateDomain(errors, env, "API_DOMAIN");
   if (studioDomain && apiDomain && studioDomain === apiDomain) {
     errors.push("STUDIO_DOMAIN and API_DOMAIN must be distinct hostnames.");
@@ -278,8 +298,18 @@ export function validateProductionEnv(rawEnv) {
 
   // 5. Public URLs & CORS alignment
   const publicApiUrl = parseHttpsUrl(errors, env, "PUBLIC_API_URL");
-  const nextPublicApiUrl = parseHttpsUrl(errors, env, "NEXT_PUBLIC_API_URL");
+  const nextPublicApiUrl = apiOnly ? null : parseHttpsUrl(errors, env, "NEXT_PUBLIC_API_URL");
   const publicWebUrl = parseHttpsUrl(errors, env, "PUBLIC_WEB_URL");
+  if (apiOnly && publicWebUrl) {
+    validateDomain(errors, { PUBLIC_WEB_URL: publicWebUrl.hostname }, "PUBLIC_WEB_URL");
+  }
+
+  if (env.COOKIE_SAMESITE !== undefined && !["lax", "none"].includes(env.COOKIE_SAMESITE)) {
+    errors.push('COOKIE_SAMESITE must be "lax" or "none".');
+  } else if (publicWebUrl && publicApiUrl && env.COOKIE_SAMESITE !== "none") {
+    const warning = crossSiteCookieWarning(publicWebUrl, publicApiUrl);
+    if (warning) warnings.push(warning);
+  }
 
   if (publicApiUrl && apiDomain && publicApiUrl.hostname.toLowerCase() !== apiDomain) {
     errors.push(`PUBLIC_API_URL hostname ("${publicApiUrl.hostname}") must match API_DOMAIN ("${apiDomain}").`);
@@ -313,8 +343,8 @@ export function validateProductionEnv(rawEnv) {
         if (lowerCors.some((item) => item === "*" || item.includes("localhost") || item.includes("127.0.0.1"))) {
           errors.push('CORS_ORIGINS must not contain "*", "localhost", or "127.0.0.1" in production.');
         }
-        if (studioDomain) {
-          const expectedOrigin = `https://${studioDomain}`;
+        if (publicWebUrl) {
+          const expectedOrigin = publicWebUrl.origin;
           if (!lowerCors.includes(expectedOrigin)) {
             errors.push(`CORS_ORIGINS must include "${expectedOrigin}".`);
           }
@@ -374,7 +404,7 @@ export function validateProductionEnv(rawEnv) {
     errors,
     warnings,
     domains: {
-      studio: studioDomain,
+      studio: apiOnly ? publicWebUrl?.hostname ?? null : studioDomain,
       api: apiDomain,
     },
   };
@@ -384,6 +414,7 @@ function parseArgs(argv) {
   const opts = {
     envFile: null,
     fromEnv: false,
+    apiOnly: false,
     json: false,
     help: false,
     unknown: null,
@@ -398,6 +429,8 @@ function parseArgs(argv) {
       opts.help = true;
     } else if (arg === "--json") {
       opts.json = true;
+    } else if (arg === "--api-only") {
+      opts.apiOnly = true;
     } else if (arg === "--from-env") {
       opts.fromEnv = true;
     } else if (arg === "-f" || arg === "--file" || arg === "--env-file") {
@@ -435,6 +468,7 @@ Usage:
 Options:
   -f, --file <path>   Validate strictly from the given .env file
   --from-env          Validate process environment variables only
+  --api-only          Use PUBLIC_WEB_URL for externally hosted Studio
   --json              Output machine-readable JSON (never prints secrets)
   -h, --help          Show this help message
 
@@ -508,7 +542,7 @@ function main() {
     }
   }
 
-  const report = validateProductionEnv(envMap);
+  const report = validateProductionEnv(envMap, { apiOnly: opts.apiOnly });
 
   if (opts.json) {
     console.log(

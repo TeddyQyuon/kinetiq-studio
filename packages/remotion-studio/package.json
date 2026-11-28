@@ -9,6 +9,7 @@
   },
   "dependencies": {
     "@kinetiq/contracts": "*",
+    "@remotion/player": "4.0.547",
     "remotion": "4.0.547"
   },
   "peerDependencies": {

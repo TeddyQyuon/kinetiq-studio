@@ -87,13 +87,6 @@ export type MusicPreset = "ambient_pulse" | "warm_pad" | "documentary_minimal";
 let csrfToken: string | null = null;
 let refreshingIdentity: Promise<IdentityStatus> | null = null;
 
-function cookieToken() {
-  if (typeof document === "undefined") return null;
-  const prefix = "__Host-kinetiq-csrf=";
-  const cookie = document.cookie.split(/;\s*/).find(value => value.startsWith(prefix));
-  return cookie?.slice(prefix.length) || null;
-}
-
 async function fetchJson<T>(path: string, init: RequestInit): Promise<T> {
   let res: Response;
   try {
@@ -133,13 +126,14 @@ async function requestJson<T>(
   if (typeof init.body === "string") headers.set("Content-Type", "application/json");
   const writes = ["POST", "PUT", "PATCH", "DELETE"].includes(init.method ?? "GET");
   if (writes) {
-    let token = csrfToken || cookieToken();
-    if (!token && backendEnvironment === "phase1_vps") {
+    // /me returns the API host's double-submit token even on a different Studio origin.
+    if (!csrfToken && (!backendEnvironment || backendEnvironment === "phase1_vps")) {
       await readIdentity();
-      token = csrfToken || cookieToken();
-      if (!token) throw new ApiError("Refresh your owner session to continue.", 403);
+      if (!csrfToken && backendEnvironment === "phase1_vps") {
+        throw new ApiError("Refresh your owner session to continue.", 403);
+      }
     }
-    if (token) headers.set("X-CSRF-Token", token);
+    if (csrfToken) headers.set("X-CSRF-Token", csrfToken);
   }
   try {
     return { data: await fetchJson<T>(path, { ...init, headers }), demo: false };
