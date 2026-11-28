@@ -10,6 +10,7 @@ from pathlib import Path
 
 import httpx
 from kinetiq_agent_core import WorkerClient
+from kinetiq_agent_core.auth import worker_token
 
 from .align_whisperx import align_words
 from .tts_kokoro import synthesize
@@ -123,10 +124,12 @@ def process_job(client: WorkerClient, job: dict, directory: Path, *, mock: bool 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Kinetiq CPU media worker")
-    parser.add_argument("--mock", action="store_true", help="Use deterministic, model-free synthesis and alignment")
-    args = parser.parse_args()
-    client = WorkerClient(os.environ["API_BASE_URL"], os.environ["WORKER_TOKEN"])
-    client.register(provider="local", profile="media", gpu_model=None, vram_gb=None, capabilities=CAPABILITIES)
+    parser.add_argument("--mock", action="store_true", default=os.getenv("MEDIA_MOCK_MODE", "").lower() == "true",
+                        help="Use deterministic, model-free synthesis and alignment")
+    parser.add_argument("--provider", choices=["local", "google_colab", "runpod"], default="local")
+    args, token = worker_token(parser)
+    client = WorkerClient(os.environ["API_BASE_URL"], token)
+    client.register(provider=args.provider, profile="media", gpu_model=None, vram_gb=None, capabilities=CAPABILITIES)
     client.start_heartbeat()
     try:
         while True:

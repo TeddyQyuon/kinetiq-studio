@@ -14,12 +14,13 @@ services:
       APP_ENV: phase1_vps
       RUN_EMBEDDED_ORCHESTRATOR: "false"
       OWNER_GOOGLE_EMAIL: ${OWNER_GOOGLE_EMAIL:-}
-    healthcheck:
-      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:8000/ready || exit 1"]
-      interval: 10s
-      timeout: 5s
-      retries: 10
-      start_period: 15s
+
+  media-worker:
+    build:
+      args:
+        INSTALL_MODELS: "true"
+    environment:
+      MEDIA_MOCK_MODE: "false"
 
   orchestrator:
     environment:
@@ -44,7 +45,7 @@ services:
       STUDIO_DOMAIN: ${STUDIO_DOMAIN:-studio.example.com}
       API_DOMAIN: ${API_DOMAIN:-api.example.com}
     volumes:
-      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - ./infra/Caddyfile:/etc/caddy/Caddyfile:ro
       - caddy_data:/data
       - caddy_config:/config
 

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import argparse
 import copy
 import json
 import math
@@ -13,6 +14,7 @@ from pathlib import Path
 
 import httpx
 from kinetiq_agent_core import WorkerClient
+from kinetiq_agent_core.auth import worker_token
 
 ENTRY_POINT = Path(__file__).resolve().with_name("composition.tsx")
 REPO = ENTRY_POINT.parents[2]
@@ -160,6 +162,10 @@ def master_audio_video(
             "input_thresh": "measured_thresh", "target_offset": "offset"}
     if all(math.isfinite(float(stats[k])) for k in keys):
         graph += ":linear=true" + "".join(f":{option}={stats[key]}" for key, option in keys.items())
+    else:
+        # Silent or sub-gate audio has no measurable integrated loudness.
+        # Passing it through loudnorm can feed NaNs to the AAC encoder.
+        graph = ";".join([*filters, mix + "anull"])
     subprocess.run([
         *base, graph + "[mix]", "-map", "0:v:0", "-map", "[mix]",
         "-c:v", "libx264", "-profile:v", "high", "-crf", "17", "-pix_fmt", "yuv420p",
@@ -193,7 +199,7 @@ def render_job(client: WorkerClient, job: dict) -> None:
             }), encoding="utf-8")
             picture = root / "picture.mp4"
             args = [
-                str(REPO / "node_modules/.bin/remotion"), "render", str(ENTRY_POINT), "EduComposition", str(picture),
+                "node", str(REPO / "node_modules/@remotion/cli/remotion-cli.js"), "render", str(ENTRY_POINT), "EduComposition", str(picture),
                 f"--props={props}", f"--public-dir={public}", "--muted", "--crf=10", "--image-format=png",
                 "--concurrency=2",
             ]
@@ -212,7 +218,9 @@ def render_job(client: WorkerClient, job: dict) -> None:
 
 
 def main() -> None:
-    client = WorkerClient(os.environ["API_BASE_URL"], os.environ["WORKER_TOKEN"])
+    parser = argparse.ArgumentParser(description=__doc__)
+    _, token = worker_token(parser)
+    client = WorkerClient(os.environ["API_BASE_URL"], token)
     client.register(provider="local", profile="render", gpu_model=None, vram_gb=None, capabilities=["render"])
     client.start_heartbeat()
     try:

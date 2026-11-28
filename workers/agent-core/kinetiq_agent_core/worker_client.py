@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import threading
 from collections.abc import Iterator
 from contextlib import contextmanager
@@ -15,10 +16,17 @@ from kinetiq_agent_core.resumable_upload import upload_file_resumable
 class WorkerClient:
     def __init__(self, api_base_url: str, worker_token: str) -> None:
         self.api_url = api_base_url.rstrip("/")
+        self.public_api_url = os.getenv("PUBLIC_API_URL", self.api_url).rstrip("/")
         self.headers = {"Authorization": f"Bearer {worker_token}"}
         self.client = httpx.Client(timeout=60)
         self.worker_id: str | None = None
         self._stop_evt = threading.Event()
+
+    def _worker_url(self, url: str) -> str:
+        # Signed API URLs use the browser-facing origin, which may be localhost in
+        # Compose. Keep the signed path/query verbatim and leave Drive URLs alone.
+        prefix = self.public_api_url + "/"
+        return self.api_url + "/" + url[len(prefix):] if url.startswith(prefix) else url
 
     def register(
         self,
@@ -104,7 +112,12 @@ class WorkerClient:
         if resp.status_code == 204:
             return None
         resp.raise_for_status()
-        return resp.json()
+        job = resp.json()
+        if job.get("input_download_url"):
+            job["input_download_url"] = self._worker_url(job["input_download_url"])
+        if urls := job["payload"].get("media_urls"):
+            job["payload"]["media_urls"] = {key: self._worker_url(url) for key, url in urls.items()}
+        return job
 
     def report_progress(self, job_id: str, percent: int, step: int | None = None, total_steps: int | None = None) -> None:
         self.client.post(
@@ -141,13 +154,13 @@ class WorkerClient:
         def _refresh_auth() -> str:
             if not s.get("token_refresh_url"):
                 return ""
-            r = self.client.post(s["token_refresh_url"], headers=self.headers)
+            r = self.client.post(f"{self.api_url}/v1/workers/jobs/{job_id}/upload-token-refresh", headers=self.headers)
             r.raise_for_status()
             return r.json().get("authorization", "")
 
         uploaded = upload_file_resumable(
             file_path,
-            session_uri=s["session_uri"],
+            session_uri=self._worker_url(s["session_uri"]) if s["provider"] == "local" else s["session_uri"],
             upload_headers=s.get("upload_headers") or {},
             content_type=content_type,
             chunk_size_bytes=int(s.get("chunk_size_bytes", 8 * 1024 * 1024)),
