@@ -29,6 +29,7 @@ def apply_command(doc: TimelineDocument, cmd: TimelineCommand) -> tuple[Timeline
     nxt = doc.model_copy(deep=True)
     visual = nxt.tracks.visual
     est_cu = 0.0
+    retime = cmd.type in {"move_scene", "delete_scene", "insert_diagram", "tighten_pauses"}
 
     if cmd.type == "trim_scene":
         idx = next((i for i, s in enumerate(visual) if s.id == cmd.scene_id), None)
@@ -78,9 +79,15 @@ def apply_command(doc: TimelineDocument, cmd: TimelineCommand) -> tuple[Timeline
         nxt.tracks.visual = _reflow(visual)
 
     elif cmd.type == "restore_scene":
-        bounded = max(0, min(len(visual), cmd.index))
-        visual.insert(bounded, cmd.scene)
-        nxt.tracks.visual = _reflow(visual)
+        idx = next((i for i, s in enumerate(visual) if s.id == cmd.scene.id), None)
+        if idx is None:
+            bounded = max(0, min(len(visual), cmd.index))
+            visual.insert(bounded, cmd.scene)
+            nxt.tracks.visual = _reflow(visual)
+            retime = True
+        else:
+            retime = visual[idx].start_ms != cmd.scene.start_ms
+            visual[idx] = cmd.scene.model_copy(deep=True)
 
     elif cmd.type == "tighten_pauses":
         nxt.tracks.visual = _reflow(visual, gap_ms=max(0, min(300, cmd.max_gap_ms)))
@@ -175,7 +182,7 @@ def apply_command(doc: TimelineDocument, cmd: TimelineCommand) -> tuple[Timeline
         if cmd.voice_speed is not None:
             nxt.voice.speed = cmd.voice_speed
 
-    if cmd.type in {"move_scene", "delete_scene", "restore_scene", "insert_diagram", "tighten_pauses"}:
+    if retime:
         retime_speech(nxt, doc.tracks.visual)
     nxt.revision += 1
     return nxt, est_cu

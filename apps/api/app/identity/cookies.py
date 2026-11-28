@@ -41,5 +41,6 @@ def unseal(purpose: str, cookie: str) -> str:
 def issue_session(response: Response, credential_id: str) -> None:
     csrf = secrets.token_urlsafe(32)
     value = seal(SESSION, f"{credential_id}.{csrf}", SESSION_TTL)
-    response.set_cookie(SESSION, value, max_age=SESSION_TTL, secure=True, httponly=True, samesite="lax")
-    response.set_cookie(CSRF, csrf, max_age=SESSION_TTL, secure=True, httponly=False, samesite="lax")
+    samesite = get_settings().cookie_samesite
+    response.set_cookie(SESSION, value, max_age=SESSION_TTL, secure=True, httponly=True, samesite=samesite)
+    response.set_cookie(CSRF, csrf, max_age=SESSION_TTL, secure=True, httponly=False, samesite=samesite)

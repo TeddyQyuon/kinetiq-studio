@@ -11,6 +11,7 @@ DRY_RUN=false
 SKIP_BACKUP=false
 SKIP_BUILD=false
 SKIP_DNS_CHECK=false
+API_ONLY=false
 
 usage() {
   cat <<'EOF'
@@ -27,6 +28,7 @@ Options:
                             (default: 120)
   --dry-run                 Run preflight checks (env, Caddyfile, compose config, DNS)
                             without mutating containers or database
+  --api-only                Serve only the API from Caddy and host Studio elsewhere
   --skip-backup             Skip pre-deploy pg_dump when postgres is already running
   --skip-build              Skip `docker compose build` before starting containers
   --skip-dns-check          Skip advisory DNS resolution check for Caddy domains
@@ -86,6 +88,10 @@ while [ $# -gt 0 ]; do
       DRY_RUN=true
       shift
       ;;
+    --api-only)
+      API_ONLY=true
+      shift
+      ;;
     --skip-backup)
       SKIP_BACKUP=true
       shift
@@ -136,24 +142,39 @@ if command -v stat >/dev/null 2>&1; then
 fi
 
 log "Running production environment preflight check..."
-node "${REPO_ROOT}/scripts/check-env.mjs" --file "$ENV_FILE"
+preflight=(node "${REPO_ROOT}/scripts/check-env.mjs" --file "$ENV_FILE")
+services=(api orchestrator media-worker render-worker caddy)
+caddyfile=Caddyfile
+if [ "$API_ONLY" = true ]; then
+  preflight+=(--api-only)
+  caddyfile=Caddyfile.api
+else
+  services+=(web)
+fi
+"${preflight[@]}"
 
-ENV_JSON="$(node "${REPO_ROOT}/scripts/check-env.mjs" --file "$ENV_FILE" --json)"
+ENV_JSON="$("${preflight[@]}" --json)"
 STUDIO_DOMAIN="$(printf '%s' "$ENV_JSON" | node -e "const d=JSON.parse(require('fs').readFileSync(0,'utf8')); process.stdout.write(d.domains.studio || '');")"
 API_DOMAIN="$(printf '%s' "$ENV_JSON" | node -e "const d=JSON.parse(require('fs').readFileSync(0,'utf8')); process.stdout.write(d.domains.api || '');")"
 
 [ -n "$STUDIO_DOMAIN" ] || fail "STUDIO_DOMAIN missing from preflight output"
 [ -n "$API_DOMAIN" ] || fail "API_DOMAIN missing from preflight output"
 
-CADDYFILE="${REPO_ROOT}/infra/Caddyfile"
-[ -f "$CADDYFILE" ] || fail "Missing Caddyfile at $CADDYFILE"
-grep -Fq '{$STUDIO_DOMAIN}' "$CADDYFILE" || fail "infra/Caddyfile must reference {\$STUDIO_DOMAIN}"
-grep -Fq '{$API_DOMAIN}' "$CADDYFILE" || fail "infra/Caddyfile must reference {\$API_DOMAIN}"
+tls_domains=("$API_DOMAIN")
+if [ "$API_ONLY" = false ]; then
+  if [[ "$STUDIO_DOMAIN" == *.vercel.app ]]; then
+    fail "Vercel manages TLS for $STUDIO_DOMAIN. Deploy the VPS with --api-only."
+  fi
+  tls_domains+=("$STUDIO_DOMAIN")
+fi
+[ -f "${REPO_ROOT}/infra/$caddyfile" ] || fail "Missing infra/$caddyfile"
+grep -Fq '{$API_DOMAIN}' "${REPO_ROOT}/infra/Caddyfile.api" || fail "Missing API site in infra/Caddyfile.api"
 
 compose() {
   local -a env_args=(
     "PATH=${PATH}"
     "HOME=${HOME:-/root}"
+    "VPS_CADDYFILE=$caddyfile"
   )
   local var
   for var in DOCKER_HOST DOCKER_CONTEXT DOCKER_CONFIG DOCKER_TLS_VERIFY DOCKER_CERT_PATH DOCKER_API_VERSION COMPOSE_PROJECT_NAME TMPDIR XDG_RUNTIME_DIR; do
@@ -173,7 +194,7 @@ compose config --quiet
 
 if [ "$SKIP_DNS_CHECK" = false ]; then
   if command -v getent >/dev/null 2>&1; then
-    for domain in "$STUDIO_DOMAIN" "$API_DOMAIN"; do
+    for domain in "${tls_domains[@]}"; do
       resolved_ip="$(getent ahosts "$domain" 2>/dev/null | awk 'NR==1 {print $1}' || true)"
       if [ -n "$resolved_ip" ]; then
         log "DNS resolved ${domain} -> ${resolved_ip}"
@@ -222,7 +243,7 @@ fi
 
 if [ "$SKIP_BUILD" = false ]; then
   log "Building Phase 1 container images..."
-  compose build
+  compose build worker-bootstrap "${services[@]}"
 fi
 
 log "Starting postgres and redis..."
@@ -261,15 +282,17 @@ if ! compose run --rm --no-deps api alembic upgrade head; then
   exit 1
 fi
 
-log "Starting api, orchestrator, media-worker, render-worker, web, and caddy..."
-compose up -d --remove-orphans api orchestrator media-worker render-worker web caddy
+log "Starting ${services[*]}..."
+compose up -d --remove-orphans "${services[@]}"
 
 log "Validating Caddyfile inside caddy container..."
 compose exec -T caddy caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile
 
 wait_until "API /health (internal)" compose exec -T api curl -fsS http://127.0.0.1:8000/health
 wait_until "API /ready (internal)" compose exec -T api curl -fsS http://127.0.0.1:8000/ready
-wait_until "Web UI (internal)" compose exec -T web node -e "fetch('http://127.0.0.1:3000').then((r)=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"
+if [ "$API_ONLY" = false ]; then
+  wait_until "Web UI (internal)" compose exec -T web node -e "fetch('http://127.0.0.1:3000').then((r)=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"
+fi
 
 for svc in orchestrator media-worker render-worker; do
   if ! compose ps --status running --services | grep -qx "$svc"; then
@@ -279,7 +302,12 @@ done
 
 wait_until "HTTPS https://${API_DOMAIN}/health" curl -fsS --max-time 10 "https://${API_DOMAIN}/health"
 wait_until "HTTPS https://${API_DOMAIN}/ready" curl -fsS --max-time 10 "https://${API_DOMAIN}/ready"
-wait_until "HTTPS https://${STUDIO_DOMAIN}/" curl -fsS --max-time 10 "https://${STUDIO_DOMAIN}/"
+if [ "$API_ONLY" = true ]; then
+  # Reclaim memory on an existing all-in-one VPS after the API cutover succeeds.
+  compose stop web
+else
+  wait_until "HTTPS https://${STUDIO_DOMAIN}/" curl -fsS --max-time 10 "https://${STUDIO_DOMAIN}/"
+fi
 
 if [ -n "$CURRENT_SHA" ]; then
   printf '%s\n' "$CURRENT_SHA" > "${BACKUP_DIR}/current_deploy_sha.txt"

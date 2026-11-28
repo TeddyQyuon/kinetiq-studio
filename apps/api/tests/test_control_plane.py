@@ -5,6 +5,7 @@ import socket
 import subprocess
 import time
 from contextlib import aclosing
+from http.cookies import SimpleCookie
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -39,6 +40,7 @@ def studio(tmp_path, monkeypatch):
         storage_provider="local",
         local_vault_dir=str(tmp_path / "vault"),
         session_secret="s" * 48,
+        cookie_samesite="lax",
         google_client_id="client",
         google_client_secret="secret",
         owner_google_email="owner@example.test",
@@ -103,6 +105,54 @@ def test_vps_owner_cookie_csrf_and_revocation(studio, monkeypatch):
     assert c.post(token_route, json={"name": "w"}, headers={"X-CSRF-Token": csrf}).status_code == 200
     assert c.post("/v1/auth/logout", headers={"X-CSRF-Token": csrf}).status_code == 200
     c.cookies.set(SESSION, cookie, domain="studio.test", path="/")
+    assert c.get("/v1/me").status_code == 401
+
+
+def test_cross_site_oauth_and_double_submit_csrf(studio, monkeypatch):
+    from app.identity.cookies import CSRF, PKCE, SESSION
+
+    studio.cfg.app_env = "phase1_vps"
+    monkeypatch.setattr(studio.cfg, "cookie_samesite", "none")
+    # Use a Studio origin from the app's credentialed CORS allowlist.
+    origin = studio.cfg.cors_origins[0]
+    monkeypatch.setattr(studio.cfg, "public_web_url", origin)
+    c = studio.client
+    c.headers["Origin"] = origin
+    mock_google(monkeypatch, {"sub": "owner", "email": studio.cfg.owner_google_email, "email_verified": True})
+
+    def check_cookie(response, name, *, expired=False):
+        value = next(h for h in response.headers.get_list("set-cookie") if h.startswith(name + "="))
+        cookie = SimpleCookie(value)[name]
+        assert name.startswith("__Host-") and cookie["path"] == "/" and not cookie["domain"]
+        assert cookie["samesite"].lower() == "none" and cookie["secure"]
+        assert bool(cookie["httponly"]) == (name in (PKCE, SESSION))
+        assert (cookie["max-age"] == "0") == expired
+
+    start = c.get("/v1/auth/google/start")
+    check_cookie(start, PKCE)
+    assert start.headers["access-control-allow-origin"] == origin
+    assert start.headers["access-control-allow-credentials"] == "true"
+    callback = c.get(
+        "/v1/auth/google/callback", params={"code": "code", "state": start.json()["state"]}, follow_redirects=False
+    )
+    assert callback.is_redirect and callback.headers["location"] == origin + "/settings?drive=connected"
+    check_cookie(callback, PKCE, expired=True)
+    check_cookie(callback, SESSION)
+    check_cookie(callback, CSRF)
+
+    token_route = "/v1/workers/tokens"
+    preflight = c.options(token_route, headers={
+        "Access-Control-Request-Method": "POST",
+        "Access-Control-Request-Headers": "content-type,x-csrf-token,if-match",
+    })
+    assert preflight.status_code == 200 and preflight.headers["access-control-allow-origin"] == origin
+    assert "x-csrf-token" in preflight.headers["access-control-allow-headers"].lower()
+    csrf = c.get("/v1/me").json()["csrf_token"]
+    assert csrf and c.post(token_route, json={"name": "w"}).status_code == 403
+    assert c.post(token_route, headers={"X-CSRF-Token": csrf}, json={"name": "w"}).status_code == 200
+    logout = c.post("/v1/auth/logout", headers={"X-CSRF-Token": csrf})
+    check_cookie(logout, SESSION, expired=True)
+    check_cookie(logout, CSRF, expired=True)
     assert c.get("/v1/me").status_code == 401
 
 

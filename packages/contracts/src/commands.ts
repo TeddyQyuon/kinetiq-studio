@@ -199,6 +199,12 @@ export function applyTimelineCommand(doc: TimelineDocument, cmd: TimelineCommand
     }
 
     case "restore_scene": {
+      const idx = next.tracks.visual.findIndex((s) => s.id === cmd.scene.id);
+      if (idx !== -1) {
+        inverse = { type: "restore_scene", scene: next.tracks.visual[idx], index: idx };
+        next.tracks.visual[idx] = structuredClone(cmd.scene);
+        break;
+      }
       const bounded = Math.max(0, Math.min(next.tracks.visual.length, cmd.index));
       next.tracks.visual.splice(bounded, 0, cmd.scene);
       next.tracks.visual = reflowSequential(next.tracks.visual);

@@ -326,6 +326,28 @@ def test_restore_scene_inserts_all_supported_visual_kinds(project, e2e_studio):
         revision = response.json()["revision"]
 
 
+def test_switch_plan_model_preserves_tracks_and_spends_no_compute(project, e2e_studio):
+    api = e2e_studio.client
+    route = project + "/timeline"
+    doc = api.get(route).json()
+    first = doc["tracks"]["visual"][0]
+    first.update(kind="ai_video", start_ms=300, source_start_ms=800, seed=123)
+    doc["tracks"]["voice"] = [{"scene_id": first["id"], "asset": "take", "start_ms": 300, "end_ms": 4000}]
+    doc["tracks"]["captions"]["words"] = [{"word": "First", "start_ms": 350, "end_ms": 700}]
+    before = api.put(route, json={"expected_revision": doc["revision"], "document": doc}).json()
+    scene = before["tracks"]["visual"][0]
+    command = {"type": "restore_scene", "index": 0, "scene": {**scene, "model": "wan22_i2v"}}
+    body = {"expected_revision": before["revision"], "commands": [command]}
+    updated = api.post(route + "/commands", headers={"If-Match": str(before["revision"])}, json=body)
+    assert updated.is_success, updated.text
+    tracks = updated.json()["tracks"]
+    assert tracks["visual"][0]["model"] == "wan22_i2v"
+    tracks["visual"][0]["model"] = scene["model"]
+    assert tracks == before["tracks"]
+    assert api.post(route + "/commands", json=body).status_code == 409
+    assert api.get(project + "/jobs").json() == []
+
+
 def test_drive_music_upload_verifies_remote_checksum(project, e2e_studio, monkeypatch):
     from types import SimpleNamespace
 

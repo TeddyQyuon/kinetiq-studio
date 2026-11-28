@@ -43,7 +43,7 @@ node scripts/smoke-test.mjs
    ```
 
 4. Set `PUBLIC_API_URL` to the external HTTPS API origin and restart the API before generating jobs. Colab needs that origin for signed input and upload URLs. The local browser can continue using `NEXT_PUBLIC_API_URL=http://localhost:8000`. Keep the laptop awake and the tunnel process running during a rehearsal. Update the origin and Colab secret if the tunnel URL changes.
-5. In **Workers**, mint a GPU token for `ltx25_pro`. Open the launcher in Google Colab, select an L4 or A100 runtime, and enable notebook access to the Colab secrets `API_BASE_URL` and `WORKER_TOKEN`. Set `HF_TOKEN` when model access requires it. Select the matching `PROFILE` in cell 1 and run cells 1–5. Wait for the worker to show online before choosing **Generate All Scenes**. [Colab launcher](../workers/gpu/colab_launcher.ipynb)
+5. In **Workers**, mint a GPU token. In Colab, request an L4 or A100 and grant the notebook access to `API_BASE_URL` and `WORKER_TOKEN`. For `ltx25_pro`, accept the Lightricks LTX-2.5 license on Hugging Face and grant access to `HF_TOKEN`. Run cells 1–5. Cell 1 selects `wan22_fast` if Colab assigns less than 20 GiB or the token is missing. Once the worker is online, use **Switch AI scenes to Wan 2.2 Fast** on the Plan board if prompted, then choose **Generate All Scenes**. [Colab launcher](../workers/gpu/colab_launcher.ipynb)
 6. Cell 6 is optional. Choose `media` with a separate `MEDIA_WORKER_TOKEN` for speech/alignment, or `colab_ai` for the notebook text helper. Approve a flagged keyframe and clip on the Plan board. In the editor, check narration and captions, then queue **Render Native 1080p MP4** under Exports. When the render is ready, download both the MP4 and SRT.
 
 ## 3. Connect Antigravity
@@ -51,6 +51,8 @@ node scripts/smoke-test.mjs
 Set a random `MCP_ACCESS_TOKEN` in the API environment and restart the API. In Studio Settings, choose **Copy MCP Config**. Paste the configuration into Antigravity's MCP settings, replace `<YOUR_MCP_ACCESS_TOKEN>` privately and confirm the URL is the intended API origin followed by `/mcp`. The transport uses HTTP with `Authorization: Bearer <token>`. Reload the connection and call the read-only `get_timeline_summary` with a project ID. Compare its revision with the editor.
 
 ## 4. Deploy and check the VPS
+
+For Studio on Vercel, follow the [Vercel and API-only VPS deployment guide](VERCEL_DEPLOY.md). The steps below host both Studio and the API on the VPS.
 
 On the VPS, install Docker with Compose v2 (including `!reset` support), Node.js 22+, Git and curl. Point the Studio and API DNS records at the VPS and allow public HTTP/HTTPS to Caddy. Configure the production root `.env` using the production template. Use distinct secrets for encryption, sessions, media signing, MCP and PostgreSQL. Preserve the encryption key with the database backup. [Production environment template](VPS_DEPLOY.md#3-generate-production-secrets--configure-env)
 

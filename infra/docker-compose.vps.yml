@@ -13,6 +13,7 @@ services:
     environment:
       APP_ENV: phase1_vps
       RUN_EMBEDDED_ORCHESTRATOR: "false"
+      COOKIE_SAMESITE: ${COOKIE_SAMESITE:-lax}
       OWNER_GOOGLE_EMAIL: ${OWNER_GOOGLE_EMAIL:-}
 
   media-worker:
@@ -34,8 +35,6 @@ services:
     image: caddy:2-alpine
     restart: unless-stopped
     depends_on:
-      web:
-        condition: service_started
       api:
         condition: service_healthy
     ports:
@@ -45,7 +44,8 @@ services:
       STUDIO_DOMAIN: ${STUDIO_DOMAIN:-studio.example.com}
       API_DOMAIN: ${API_DOMAIN:-api.example.com}
     volumes:
-      - ./infra/Caddyfile:/etc/caddy/Caddyfile:ro
+      - ./infra/${VPS_CADDYFILE:-Caddyfile}:/etc/caddy/Caddyfile:ro
+      - ./infra/Caddyfile.api:/etc/caddy/Caddyfile.api:ro
       - caddy_data:/data
       - caddy_config:/config
 

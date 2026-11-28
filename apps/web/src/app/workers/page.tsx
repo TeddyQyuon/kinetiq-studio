@@ -4,6 +4,7 @@ import React, { useEffect, useRef, useState } from "react";
 import { Check, ClipboardCopy, Cpu, KeyRound, Terminal } from "lucide-react";
 import type { HealthMetricsResponse, WorkerRecord } from "@kinetiq/contracts";
 import { api } from "@/lib/api-client";
+import { hasLowVram, isOnlineGpuWorker } from "@/lib/worker-capabilities";
 import { StatusBadge } from "@/components/StatusBadge";
 
 export default function WorkersPage() {
@@ -72,6 +73,7 @@ export default function WorkersPage() {
     }
   }
 
+  const lowVramWorkers = workers.filter(worker => isOnlineGpuWorker(worker) && hasLowVram(worker));
   return (
     <div className="mx-auto max-w-6xl space-y-6 p-6 md:p-8">
       <div>
@@ -82,6 +84,17 @@ export default function WorkersPage() {
       </div>
 
       {message && <p role="status" className="rounded-lg border border-amber-500/40 px-4 py-2 text-sm text-amber-200">{message}</p>}
+      {lowVramWorkers.length > 0 && (
+        <aside role="status" className="space-y-1 rounded-lg border border-amber-500/40 bg-amber-500/10 px-4 py-3 text-sm text-amber-200">
+          <p className="font-semibold">Lower-VRAM GPU online</p>
+          <ul>
+            {lowVramWorkers.map(worker => (
+              <li key={worker.id}>{worker.name} · {worker.gpu_model ?? "Unknown GPU"} ({worker.vram_gb} GiB)</li>
+            ))}
+          </ul>
+          <p>Colab can assign a lower-VRAM GPU when an L4 or A100 is unavailable. Use <code>wan22_fast</code> on this hardware or reconnect to Colab later for an L4 or A100.</p>
+        </aside>
+      )}
       <section className="space-y-3">
         <div className="flex flex-wrap items-center justify-between gap-2">
           <h2 className="text-lg font-semibold">System Health &amp; Telemetry</h2>
@@ -222,7 +235,7 @@ export default function WorkersPage() {
                     <StatusBadge value={w.status} />
                   </div>
                   <div className="mt-0.5 text-zinc-400">
-                    {w.provider} · {w.profile} · {w.gpu_model ?? "Awaiting register"} ({w.vram_gb ?? 0} GB)
+                    {w.provider} · {w.profile} · {w.gpu_model ?? "Awaiting register"} ({w.vram_gb ?? 0} GiB)
                   </div>
                 </div>
               </div>
