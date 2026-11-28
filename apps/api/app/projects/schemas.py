@@ -54,3 +54,26 @@ class SceneRegenerateRequest(BaseModel):
     model: Literal["ltx25_fp8", "wan22_i2v", "qwen_image"] | None = None
     camera: Literal["static", "slow_dolly_in", "aerial_pullback", "cinematic_orbit", "macro_pan"] | None = None
     seed: int | None = None
+
+
+class ProjectDuplicateRequest(BaseModel):
+    title: str | None = Field(default=None, min_length=1, max_length=255)
+
+
+class MusicMixOptions(BaseModel):
+    volume: float = Field(default=0.25, ge=0, le=1, allow_inf_nan=False)
+    duck_db: float = Field(default=-26, le=0, allow_inf_nan=False)
+
+
+class MusicFileOptions(MusicMixOptions):
+    mood: str = Field(default="custom", min_length=1, max_length=128)
+
+
+class MusicPresetRequest(MusicMixOptions):
+    preset: Literal["ambient_pulse", "warm_pad", "documentary_minimal"]
+
+
+class MusicUploadResponse(BaseModel):
+    asset_id: str
+    media_url: str
+    timeline: TimelineDocument

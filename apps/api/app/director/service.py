@@ -402,6 +402,11 @@ def accept_copilot_proposal(
     if not run or not run.proposal_payload:
         raise NotFoundError(f"Copilot proposal {proposal_id} not found")
 
+    if run.proposal_status == "accepted":
+        return get_latest_timeline(db, project_id)
+    if run.proposal_status != "pending":
+        raise ConflictError("This proposal is no longer pending")
+
     est_cu = float(run.proposal_payload.get("est_cu", 0.0))
     if est_cu > 1.0 and not confirm_gpu_spend:
         raise QuotaConfirmationRequiredError(
@@ -410,15 +415,15 @@ def accept_copilot_proposal(
 
     from pydantic import TypeAdapter
     cmds = [TypeAdapter(TimelineCommand).validate_python(c) for c in run.proposal_payload["commands"]]
+    run.proposal_status = "accepted"
+    run.proposal_payload = {**run.proposal_payload, "status": "accepted"}
     if cmds:
-        updated = apply_timeline_commands(db, project_id, expected_revision, cmds, author="ai")
+        updated = apply_timeline_commands(db, project_id, expected_revision, cmds, author="ai", dispatch_jobs=True)
     else:
         updated = get_latest_timeline(db, project_id)
         if updated.revision != expected_revision:
             raise ConflictError("The timeline revision has changed.")
-    run.proposal_status = "accepted"
-    run.proposal_payload = {**run.proposal_payload, "status": "accepted"}
-    db.commit()
+        db.commit()
     return updated
 
 

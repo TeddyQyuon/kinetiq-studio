@@ -15,6 +15,9 @@ from app.exports.service import finish_export
 from app.identity.service import ensure_default_owner, get_valid_google_access_token
 from app.jobs.service import claim_next_job, enqueue_job, estimate_colab_cu, fail_job, renew_job_lease
 from app.models import Asset, Job, Project, Worker
+from app.projects.speech import (
+    MAX_WORD_BYTES, apply_speech_completion, read_word_timings,
+)
 from app.qa.service import evaluate_keyframe_with_hotl
 from app.storage.drive import get_storage_provider
 from app.timeline.schemas import SceneAssetRefs, SceneQASummary
@@ -327,6 +330,7 @@ async def complete_job(
         raise ValidationFailedError("A render requires both an MP4 export and an SRT sidecar")
 
     files = []
+    words = None
     for art in body.artifacts:
         prefix = _upload_prefix(job, art.asset_kind)
         if job.job_type in SCOPED_JOBS and (
@@ -335,6 +339,8 @@ async def complete_job(
             or art.storage_key[len(prefix):] in {"", ".", ".."}
         ):
             raise ValidationFailedError("Artifact does not belong to this upload attempt")
+        if job.job_type == "align" and art.size_bytes > MAX_WORD_BYTES:
+            raise ValidationFailedError("Word timing JSON exceeds 1 MiB")
         verified = await provider.verify_uploaded_file(
             user_id=user.id,
             storage_key=art.storage_key,
@@ -342,6 +348,8 @@ async def complete_job(
             expected_size=art.size_bytes,
             expected_sha256=art.sha256,
         )
+        if job.job_type == "align":
+            words = await read_word_timings(provider, owner_id=user.id, verified=verified)
         files.append((art, verified))
 
     # Verify uploads before taking the write lock. All asset,
@@ -383,6 +391,9 @@ async def complete_job(
     job.lease_until = None
     job.result = {**body.result_meta, "asset_ids": {k: v.id for k, v in created_assets.items()}}
 
+    if words is not None:
+        job.result = {**job.result, "word_timings": [w.model_dump() for w in words]}
+
     worker.status = "online"
     worker.last_heartbeat = datetime.now(timezone.utc)
     worker.cu_used_month = round((worker.cu_used_month or 0.0) + cu, 4)
@@ -391,14 +402,18 @@ async def complete_job(
         finish_export(db, job, created_assets)
         db.commit()
         return {"ok": True, "cu_charged": cu}
-    if job.job_type in {"tts", "align"}:
-        # Export jobs refer to the immutable inputs and outputs by job ID.
-        db.commit()
-        return {"ok": True, "cu_charged": cu}
-
-    # Update TimelineDocument & trigger HOTL QA or next DAG stage
+    # Another completed worker may have advanced the project during upload verification.
+    db.refresh(project, ["current_revision"])
     doc = get_latest_timeline(db, project.id)
     scene_item = next((s for s in doc.tracks.visual if s.id == job.scene_id), None)
+
+    if job.job_type in {"tts", "align"}:
+        if scene_item and apply_speech_completion(db, doc, scene_item, job, created_assets, words):
+            save_timeline_document(db, project, doc.revision, doc, author="ai")
+        else:
+            # Deleted or edited scenes can still have a frozen export awaiting this output.
+            db.commit()
+        return {"ok": True, "cu_charged": cu}
 
     if (scene_item and job.job_type in UPSCALE_JOBS | {"transcode"}
             and job.payload.get("master_asset_id")

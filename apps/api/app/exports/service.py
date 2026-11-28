@@ -2,46 +2,21 @@
 
 from __future__ import annotations
 
-from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.core.config import get_settings
 from app.core.crypto import sign_media_token
 from app.core.errors import NotFoundError, ValidationFailedError
 from app.events.service import emit_event
-from app.jobs.service import compute_idempotency_key, enqueue_job
+from app.projects.speech import (
+    alignment_job, enqueue_dependency, merge_scene_words, speech_jobs, synced_voice, word_list,
+)
 from app.models import Asset, Export, Job, TimelineRevision
 from app.timeline.schemas import TimelineDocument, VoiceClipItem
 
 
-def _enqueue_dependency(
-    db: Session, project_id: str, scene_id: str, job_type: str, payload: dict,
-    *, depends_on: list[str] | None = None, est_cu: float = 0.0,
-) -> Job:
-    # Two exports may request identical inputs at once. Keep the winner's job,
-    # or create a new attempt chain if that input previously exhausted its retries.
-    salt = None
-    while True:
-        try:
-            with db.begin_nested():
-                return enqueue_job(
-                    db, project_id=project_id, scene_id=scene_id, job_type=job_type, capability=job_type,
-                    payload=payload, depends_on=depends_on, est_cu=est_cu, salt=salt,
-                )
-        except IntegrityError:
-            key_payload = {**payload, "_salt": salt} if salt else payload
-            key = compute_idempotency_key(project_id, scene_id, job_type, key_payload)
-            existing = db.query(Job).filter_by(idempotency_key=key).one_or_none()
-            if existing is None:
-                raise
-            if existing.status != "dead":
-                return existing
-            salt = existing.id
-
-
 def enqueue_export_dependencies(db: Session, doc: TimelineDocument, resolution: str) -> list[str]:
     deps = []
-    voice_by_scene = {clip.scene_id: clip for clip in doc.tracks.voice}
     captions = doc.tracks.captions
     for scene in doc.tracks.visual:
         refs = scene.assets
@@ -51,27 +26,20 @@ def enqueue_export_dependencies(db: Session, doc: TimelineDocument, resolution: 
         if scene.kind == "image_motion" and not (has_clip or (refs and refs.keyframe)):
             raise ValidationFailedError(f"Scene {scene.id} needs a keyframe or a full-resolution clip before export")
         if resolution == "4k" and scene.kind != "diagram" and refs and refs.master and not refs.upscaled_4k:
-            up = _enqueue_dependency(
+            up = enqueue_dependency(
                 db, doc.project_id, scene.id, "upscale_seedvr2",
                 {"master_asset_id": refs.master, "revision": doc.revision}, est_cu=0.12,
             )
             deps.append(up.id)
         if not scene.narration.strip():
             continue
-        clip = voice_by_scene.get(scene.id)
-        # Speech inputs are fully captured here, so unrelated timeline edits can reuse them.
-        speech = {"narration": scene.narration, "voice": doc.voice.model_dump()}
-        tts_deps = []
-        if clip and clip.asset:
-            source = {"audio_asset_id": clip.asset}
-        else:
-            tts = _enqueue_dependency(db, doc.project_id, scene.id, "tts", speech)
-            deps.append(tts.id)
-            tts_deps.append(tts.id)
-            source = {"tts_job_id": tts.id}
-        if not captions.words and not captions.words_asset:
-            align = _enqueue_dependency(db, doc.project_id, scene.id, "align", {**speech, **source}, depends_on=tts_deps)
-            deps.append(align.id)
+        audio, producer = synced_voice(db, doc, scene)
+        if audio is None:
+            tts, align = speech_jobs(db, doc, scene)
+            deps.extend([tts.id, align.id])
+        elif not any(scene.start_ms <= w.start_ms < scene.end_ms for w in captions.words or []):
+            if not captions.words_asset or captions.words:
+                deps.append(alignment_job(db, doc, scene, tts=producer, audio=audio).id)
     return deps
 
 
@@ -89,8 +57,10 @@ def build_render_payload(db: Session, job: Job) -> dict:
         raise NotFoundError(f"Timeline revision {exp.revision} for export {exp.id} is missing")
     doc = TimelineDocument.model_validate(revision.document)
     scenes = {scene.id: scene for scene in doc.tracks.visual}
-    voices = {clip.scene_id: clip for clip in doc.tracks.voice}
     scene_words: dict[str, str] = {}
+    # An external whole-timeline caption file remains authoritative when there
+    # are no inline timings. Preserve it alongside any per-scene renderer inputs.
+    external_captions = doc.tracks.captions.words_asset and not doc.tracks.captions.words
 
     # Only consume artifacts from the dependencies of this specific render. The live
     # timeline may already refer to a newly generated clip or a different voice.
@@ -101,14 +71,16 @@ def build_render_payload(db: Session, job: Job) -> dict:
             continue
         outputs = (dep.result or {}).get("asset_ids", {})
         if dep.job_type == "tts":
-            clip = voices.get(scene.id)
+            # Keep the author's timing from the frozen revision.
+            clip = next((v for v in doc.tracks.voice if v.scene_id == scene.id), None)
             if clip is None:
                 clip = VoiceClipItem(scene_id=scene.id, start_ms=scene.start_ms, end_ms=scene.end_ms)
                 doc.tracks.voice.append(clip)
-                voices[scene.id] = clip
             clip.asset = outputs["audio"]
         elif dep.job_type == "align":
             scene_words[scene.id] = outputs["words"]
+            if not external_captions and "word_timings" in (dep.result or {}):
+                merge_scene_words(doc, scene, word_list.validate_python(dep.result["word_timings"]))
         elif dep.job_type in {"upscale_seedvr2", "upscale_flashvsr"} and scene.assets:
             scene.assets.upscaled_4k = outputs["upscaled_4k"]
 

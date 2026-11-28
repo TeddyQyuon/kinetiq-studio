@@ -4,6 +4,7 @@ import copy
 import random
 
 from app.core.errors import NotFoundError
+from app.projects.speech import retime_speech
 from app.timeline.schemas import (
     ScenePromptBundle,
     SceneQASummary,
@@ -89,7 +90,8 @@ def apply_command(doc: TimelineDocument, cmd: TimelineCommand) -> tuple[Timeline
         if idx is None:
             raise NotFoundError(f"Scene {cmd.scene_id} not found")
         visual[idx].narration = cmd.narration
-        visual[idx].status = "generating_audio"
+        if visual[idx].status in {"planned", "ready"}:
+            visual[idx].status = "generating_audio"
 
     elif cmd.type == "regenerate_clip":
         idx = next((i for i, s in enumerate(visual) if s.id == cmd.scene_id), None)
@@ -173,5 +175,7 @@ def apply_command(doc: TimelineDocument, cmd: TimelineCommand) -> tuple[Timeline
         if cmd.voice_speed is not None:
             nxt.voice.speed = cmd.voice_speed
 
+    if cmd.type in {"move_scene", "delete_scene", "restore_scene", "insert_diagram", "tighten_pauses"}:
+        retime_speech(nxt, doc.tracks.visual)
     nxt.revision += 1
     return nxt, est_cu

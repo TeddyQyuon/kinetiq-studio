@@ -7,15 +7,18 @@ from sqlalchemy.orm import Session
 
 from app.core.config import get_settings
 from app.core.crypto import sign_media_token
+from app.core.errors import ConflictError, NotFoundError, ValidationFailedError
 from app.director.service import build_deterministic_storyboard, storyboard_to_timeline
 from app.events.service import emit_event
 from app.identity.service import ensure_default_owner
 from app.jobs.service import enqueue_job
 from app.models import Asset, Job, Project, QAReview, Scene, TimelineRevision
+from app.projects.media import MusicInput, store_music
+from app.projects.speech import enqueue_dependency, prepare_scene_speech, synced_voice
 from app.qa.service import CLIP_MODELS
-from app.projects.schemas import ProjectCreateRequest, ProjectDetailRead, ProjectSummaryRead
-from app.timeline.schemas import TimelineCommand
-from app.timeline.service import apply_timeline_commands, get_latest_timeline, sync_scenes_projection
+from app.projects.schemas import MusicUploadResponse, ProjectCreateRequest, ProjectDetailRead, ProjectSummaryRead
+from app.timeline.schemas import MusicTrackConfig, SceneQASummary, TimelineCommand, TimelineDocument
+from app.timeline.service import apply_timeline_commands, get_latest_timeline, save_timeline_document, sync_scenes_projection
 
 
 def build_project_summary(db: Session, project: Project) -> ProjectSummaryRead:
@@ -98,21 +101,17 @@ def dispatch_generation_pipeline(db: Session, project: Project) -> list[str]:
     queued_job_ids: list[str] = []
 
     for scene in doc.tracks.visual:
-        if scene.kind == "diagram":
-            continue
-        if scene.status == "ready" and scene.assets and scene.assets.master:
-            continue
-        job = enqueue_job(
-            db,
-            project_id=project.id,
-            scene_id=scene.id,
-            job_type="keyframe_qwen",
-            capability="keyframe_qwen",
-            payload={"seed": scene.seed or 42, "aspect": doc.format.aspect},
-            est_cu=0.02,
-        )
-        queued_job_ids.append(job.id)
-        scene.status = "generating_keyframe"
+        if scene.kind != "diagram" and not (scene.assets and (scene.assets.master or scene.assets.keyframe)):
+            job = enqueue_dependency(
+                db, project.id, scene.id, "keyframe_qwen",
+                {"seed": scene.seed if scene.seed is not None else 42, "aspect": doc.format.aspect},
+                est_cu=0.02,
+            )
+            queued_job_ids.append(job.id)
+            scene.status = "generating_keyframe"
+        if scene.narration.strip() and not synced_voice(db, doc, scene)[0]:
+            tts, align = prepare_scene_speech(db, doc, scene)
+            queued_job_ids.extend([tts.id, align.id])
 
     project.status = "generating"
     emit_event(
@@ -121,8 +120,20 @@ def dispatch_generation_pipeline(db: Session, project: Project) -> list[str]:
         {"project_id": project.id, "queued_jobs": len(queued_job_ids)},
         project_id=project.id,
     )
-    db.commit()
+    save_timeline_document(db, project, doc.revision, doc, author="ai")
     return queued_job_ids
+
+
+def enqueue_scene_revoice(db: Session, project: Project, scene_id: str) -> dict:
+    doc = get_latest_timeline(db, project.id)
+    scene = next((s for s in doc.tracks.visual if s.id == scene_id), None)
+    if scene is None:
+        raise NotFoundError(f"Scene {scene_id} not found")
+    if not scene.narration.strip():
+        raise ValidationFailedError("A scene needs narration before re-voicing")
+    tts, align = prepare_scene_speech(db, doc, scene, revoice=True)
+    save_timeline_document(db, project, doc.revision, doc, author="user")
+    return {"ok": True, "tts_job_id": tts.id, "align_job_id": align.id}
 
 
 def approve_scene_and_dispatch(db: Session, project: Project, scene_id: str) -> dict:
@@ -180,3 +191,63 @@ def project_qa_analytics(db: Session, project_id: str) -> dict:
         if name in models:
             models[name] = {"reviews": total, "passed": passed, "pass_rate": passed / total, "retry_count": retries}
     return {"project_id": project_id, "models": models}
+
+
+def check_project_revision(project: Project, expected: int | None) -> int:
+    if expected is not None and expected != project.current_revision:
+        raise ConflictError(
+            f"Revision conflict: expected {expected}, server is at {project.current_revision}",
+            details={"server_revision": project.current_revision},
+        )
+    return project.current_revision
+
+
+async def attach_music(db: Session, project: Project, music: MusicInput, revision: int) -> MusicUploadResponse:
+    asset = await store_music(db, project, music, revision)
+    db.add(asset)
+    emit_event(db, "asset.synced", {"asset_id": asset.id, "kind": "music"}, project_id=project.id)
+    # Keep the verified asset discoverable even if a concurrent edit wins the timeline revision.
+    db.commit()
+    db.refresh(project)
+    check_project_revision(project, revision)
+    doc = get_latest_timeline(db, project.id)
+    doc.tracks.music = MusicTrackConfig(asset=asset.id, **music.options.model_dump())
+    saved = save_timeline_document(db, project, revision, doc)
+    base = get_settings().public_api_url.rstrip("/")
+    return MusicUploadResponse(
+        asset_id=asset.id, media_url=f"{base}/v1/media/{asset.id}?t={sign_media_token(asset.id)}", timeline=saved,
+    )
+
+
+def detach_music(db: Session, project: Project, revision: int) -> TimelineDocument:
+    doc = get_latest_timeline(db, project.id)
+    doc.tracks.music.asset = None
+    return save_timeline_document(db, project, revision, doc)
+
+
+def duplicate_project(db: Session, source: Project, title: str | None) -> Project:
+    doc = get_latest_timeline(db, source.id)
+    duplicate = Project(
+        owner_id=source.owner_id, title=title or f"{source.title[:248]} (Copy)", topic=source.topic,
+        aspect=source.aspect, target_res=source.target_res, duration_preset=source.duration_preset,
+        qa_policy=source.qa_policy, brain_mode=source.brain_mode, status="planned", current_revision=0,
+    )
+    db.add(duplicate)
+    db.flush()
+    doc.project_id = duplicate.id
+    doc.tracks.voice = []
+    doc.tracks.captions.words = None
+    doc.tracks.captions.words_asset = None
+    doc.tracks.music.asset = None
+    for i, scene in enumerate(doc.tracks.visual, 1):
+        scene.id = f"{duplicate.id}_scn_{i:03d}"
+        scene.assets = None
+        scene.source_start_ms = 0
+        if scene.kind == "diagram":
+            scene.status = "ready"
+        else:
+            scene.status = "planned"
+            scene.qa = SceneQASummary(score=None, attempts=0, verdict="pending")
+    emit_event(db, "project.created", {"project_id": duplicate.id, "title": duplicate.title}, project_id=duplicate.id)
+    save_timeline_document(db, duplicate, 0, doc)
+    return duplicate
