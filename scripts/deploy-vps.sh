@@ -246,8 +246,8 @@ wait_until() {
 wait_until "PostgreSQL" compose exec -T postgres pg_isready -U postgres
 wait_until "Redis" compose exec -T redis redis-cli ping
 
-log "Stopping existing api and orchestrator containers before migrations..."
-compose stop api orchestrator
+log "Stopping existing api, orchestrator, and worker containers before migrations..."
+compose stop api orchestrator media-worker render-worker
 
 log "Running Alembic database migrations (alembic upgrade head)..."
 if ! compose run --rm --no-deps api alembic upgrade head; then
@@ -261,8 +261,8 @@ if ! compose run --rm --no-deps api alembic upgrade head; then
   exit 1
 fi
 
-log "Starting api, orchestrator, web, and caddy..."
-compose up -d --remove-orphans api orchestrator web caddy
+log "Starting api, orchestrator, media-worker, render-worker, web, and caddy..."
+compose up -d --remove-orphans api orchestrator media-worker render-worker web caddy
 
 log "Validating Caddyfile inside caddy container..."
 compose exec -T caddy caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile
@@ -271,9 +271,11 @@ wait_until "API /health (internal)" compose exec -T api curl -fsS http://127.0.0
 wait_until "API /ready (internal)" compose exec -T api curl -fsS http://127.0.0.1:8000/ready
 wait_until "Web UI (internal)" compose exec -T web node -e "fetch('http://127.0.0.1:3000').then((r)=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"
 
-if ! compose ps --status running --services | grep -qx "orchestrator"; then
-  fail "Dedicated orchestrator container is not running!"
-fi
+for svc in orchestrator media-worker render-worker; do
+  if ! compose ps --status running --services | grep -qx "$svc"; then
+    fail "Required service '${svc}' is not running!"
+  fi
+done
 
 wait_until "HTTPS https://${API_DOMAIN}/health" curl -fsS --max-time 10 "https://${API_DOMAIN}/health"
 wait_until "HTTPS https://${API_DOMAIN}/ready" curl -fsS --max-time 10 "https://${API_DOMAIN}/ready"
